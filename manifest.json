@@ -1,0 +1,11 @@
+{
+    "display_name": "Fisher Cost",
+    "loading_order": 210,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Ivan + Claude",
+    "version": "1.0.0",
+    "homePage": ""
+}

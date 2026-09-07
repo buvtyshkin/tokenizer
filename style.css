@@ -1,0 +1,63 @@
+/* Строка под ответом — тихая, серым, в одну линию */
+.fc-line {
+    display: block;
+    margin-top: 6px;
+    font-size: 0.74em;
+    line-height: 1.5;
+    opacity: 0.62;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.fc-line > span + span::before { content: ' · '; opacity: 0.6; }
+.fc-line .fc-model { font-variant-numeric: tabular-nums; }
+.fc-line .fc-cost { font-weight: 600; }
+.fc-hit-good { color: #8fd694; }
+.fc-hit-mid  { color: #e2c46b; }
+.fc-hit-bad  { color: #ef8b8b; }
+.fc-unpriced { color: #e2c46b; }
+.fc-dim { opacity: 0.6; font-weight: normal; }
+
+/* Панель настроек */
+#fisher_cost_settings .fc-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0;
+}
+#fisher_cost_settings .fc-select { width: auto; margin-left: 6px; }
+#fisher_cost_settings .fc-details { margin: 8px 0; }
+#fisher_cost_settings .fc-details summary { cursor: pointer; }
+#fisher_cost_settings textarea { width: 100%; font-family: monospace; font-size: 0.8em; margin-top: 6px; }
+
+/* Отчёт */
+.fc-report { text-align: left; font-size: 0.92em; }
+.fc-report h3 {
+    margin: 14px 0 6px;
+    font-size: 1.05em;
+    font-weight: 600;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+}
+.fc-report h3:first-child { margin-top: 0; }
+.fc-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+}
+.fc-table th, .fc-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.12));
+    vertical-align: baseline;
+}
+.fc-table th { font-weight: normal; opacity: 0.6; text-align: right; font-size: 0.85em; }
+.fc-table th:first-child { text-align: left; }
+.fc-table .fc-num { text-align: right; white-space: nowrap; }
+.fc-table .fc-lbl { text-align: left; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-table.fc-narrow { width: auto; min-width: 40%; }
+.fc-cur { margin: 4px 0 10px; line-height: 1.5; }
+.fc-actions { display: flex; gap: 8px; margin-top: 12px; }
+.fc-foot { margin-top: 10px; font-size: 0.85em; }
+.fc-report .fc-select { width: auto; font-size: 0.85em; }
