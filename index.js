@@ -13,6 +13,8 @@ const ATTACH_WAIT_MS = 2500;               // сколько ждём MESSAGE_RE
 
 const DEFAULTS = {
     showUnderMessage: true,
+    compactLine: 'auto',       // 'auto' — компактно на узких экранах, 'always', 'never'
+    injectUsageOption: true,   // Custom-источник: добавлять stream_options.include_usage
     defaultTtl: '1h',          // если API не прислал разбивку cache_creation по TTL
     pricingOverride: '',       // JSON поверх pricing.json
     raw: [],                   // [{t, chat, model, kind, in, out, cr, cw5, cw1, cost, priced}]
@@ -93,7 +95,7 @@ async function loadPricing() {
         }
     }
     pricing = { ...base, ...override };
-    delete pricing._comment;
+    for (const k of Object.keys(pricing)) if (k.startsWith('_')) delete pricing[k];
 }
 
 function findPrice(model) {
@@ -108,6 +110,15 @@ function findPrice(model) {
     return pricing[Object.keys(pricing).find((k) => k.toLowerCase() === best)];
 }
 
+/** Пиковые часы провайдера (DeepSeek): peak_hours_utc: [[1,4],[6,10]], offpeak_factor: 0.5 */
+function isPeakNow(p) {
+    if (!p.peak_hours_utc) return true;
+    const d = new Date();
+    if (p.peak_weekdays_only && (d.getUTCDay() === 0 || d.getUTCDay() === 6)) return false;
+    const h = d.getUTCHours() + d.getUTCMinutes() / 60;
+    return p.peak_hours_utc.some(([a, b]) => h >= a && h < b);
+}
+
 /** Стоимость фиксируется здесь один раз, при генерации, и больше не пересчитывается. */
 function computeCost(u) {
     const p = findPrice(u.model);
@@ -116,13 +127,20 @@ function computeCost(u) {
     if (cw5 == null && cw1 == null) {
         if (settings.defaultTtl === '1h') { cw1 = u.cw; cw5 = 0; } else { cw5 = u.cw; cw1 = 0; }
     }
+    // длинный контекст (Gemini Pro, OpenAI, xAI): весь запрос по повышенному тарифу
+    const promptTotal = (u.in || 0) + (u.cr || 0) + (u.cw || 0);
+    const long = p.long_threshold && promptTotal > p.long_threshold;
+    const rIn = long ? (p.input_long ?? p.input) : p.input;
+    const rOut = long ? (p.output_long ?? p.output) : p.output;
+    const rCr = long ? (p.cache_read_long ?? p.cache_read) : p.cache_read;
+    const factor = isPeakNow(p) ? 1 : (p.offpeak_factor ?? 1);
     const cost =
-        (u.in || 0) * (p.input || 0) +
-        (u.out || 0) * (p.output || 0) +
-        (u.cr || 0) * (p.cache_read || 0) +
+        (u.in || 0) * (rIn || 0) +
+        (u.out || 0) * (rOut || 0) +
+        (u.cr || 0) * (rCr || 0) +
         (cw5 || 0) * (p.cache_write_5m ?? p.cache_write ?? 0) +
         (cw1 || 0) * (p.cache_write_1h ?? p.cache_write ?? 0);
-    return { cost: cost / 1e6, priced: true };
+    return { cost: (cost * factor) / 1e6, priced: true, long: !!long, offpeak: factor !== 1 };
 }
 
 // ---------- разбор стрима ----------
@@ -132,7 +150,7 @@ async function consumeStream(stream, meta) {
     const reader = stream.getReader();
     const dec = new TextDecoder();
     let buf = '';
-    const u = { model: meta.model || null, in: 0, out: 0, cr: 0, cw: 0, cw5: null, cw1: null, seen: false };
+    const u = { model: meta.model || null, in: 0, out: 0, cr: 0, cw: 0, cw5: null, cw1: null, think: 0, seen: false };
 
     const handle = (obj) => {
         if (!obj || typeof obj !== 'object') return;
@@ -160,13 +178,29 @@ async function consumeStream(stream, meta) {
             u.seen = true;
             return;
         }
-        // OpenAI-совместимые (NanoGPT и т.п.) — usage приходит в последнем чанке
-        if (obj.usage && (obj.usage.prompt_tokens != null || obj.usage.completion_tokens != null)) {
-            const mu = obj.usage;
-            const cached = mu.prompt_tokens_details?.cached_tokens ?? mu.prompt_cache_hit_tokens ?? 0;
+        // Google AI Studio / Vertex: usageMetadata в каждом чанке, значения накопительные
+        if (obj.usageMetadata) {
+            const g = obj.usageMetadata;
+            if (obj.modelVersion) u.model = obj.modelVersion;
+            const cached = g.cachedContentTokenCount || 0;
+            if (g.promptTokenCount != null) { u.in = g.promptTokenCount - cached; u.cr = cached; }
+            const cand = g.candidatesTokenCount ?? null;
+            const think = g.thoughtsTokenCount ?? 0;
+            if (cand != null) { u.out = cand + think; u.think = think; }   // thinking у Google оплачивается как выход
+            u.seen = true;
+            return;
+        }
+        // OpenAI-совместимые: OpenAI/NanoGPT/DeepSeek/xAI — obj.usage; Moonshot/Kimi — choices[0].usage
+        const mu = obj.usage || obj.choices?.[0]?.usage;
+        if (mu && (mu.prompt_tokens != null || mu.completion_tokens != null)) {
+            // OpenAI: prompt_tokens_details.cached_tokens; Moonshot: cached_tokens; DeepSeek: prompt_cache_hit_tokens
+            const cached = mu.prompt_tokens_details?.cached_tokens ?? mu.cached_tokens ?? mu.prompt_cache_hit_tokens ?? 0;
             u.in = (mu.prompt_tokens || 0) - cached;
             u.cr = cached;
+            u.cw = mu.prompt_tokens_details?.cache_write_tokens ?? u.cw;
             u.out = mu.completion_tokens || 0;
+            const think = mu.completion_tokens_details?.reasoning_tokens;
+            if (think) u.think = think;   // уже входит в completion_tokens
             if (obj.model) u.model = obj.model;
             u.seen = true;
         }
@@ -216,7 +250,10 @@ function installFetchHook() {
 
         try {
             const [forTavern, forUs] = response.body.tee();
-            consumeStream(forUs, meta).then((u) => { if (u) onUsage(u, meta); });
+            consumeStream(forUs, meta).then((u) => {
+                if (u) onUsage(u, meta);
+                else warnNoUsage(meta);
+            });
             return new Response(forTavern, {
                 status: response.status,
                 statusText: response.statusText,
@@ -230,6 +267,17 @@ function installFetchHook() {
     window.__fisherCostFetchPatched = true;
 }
 
+let lastNoUsageWarn = 0;
+function warnNoUsage(meta) {
+    const now = Date.now();
+    if (now - lastNoUsageWarn < 120_000) return;
+    lastNoUsageWarn = now;
+    const hint = meta.source === 'custom'
+        ? 'провайдер не прислал usage в стриме. Включи в настройках Fisher Cost «добавлять stream_options.include_usage» или впиши это в Additional body parameters.'
+        : `провайдер (${meta.source || '?'}) не прислал usage в стриме — стоимость не посчитана.`;
+    toastr.warning('Fisher Cost: ' + hint, '', { timeOut: 10000 });
+}
+
 function warnNonStream() {
     const now = Date.now();
     if (now - lastNonStreamWarn < 60_000) return;
@@ -237,10 +285,26 @@ function warnNonStream() {
     toastr.info('Fisher Cost: стриминг выключен — сервер Таверны выбрасывает usage, стоимость не посчитана.', '', { timeOut: 8000 });
 }
 
+/** Custom-источник (Moonshot, NanoGPT и т.п.): просим usage в последнем чанке стрима. */
+function onSettingsReady(generate_data) {
+    if (!settings.injectUsageOption) return;
+    if (generate_data?.chat_completion_source !== 'custom' || !generate_data.stream) return;
+    const cur = String(generate_data.custom_include_body || '').trim();
+    if (/include_usage/.test(cur)) return;
+    if (!cur) {
+        generate_data.custom_include_body = '{"stream_options":{"include_usage":true}}';
+    } else if (cur.startsWith('{') && cur.endsWith('}')) {
+        const inner = cur.slice(1, -1).trim();
+        generate_data.custom_include_body = '{' + (inner ? inner + ',' : '') + '"stream_options":{"include_usage":true}}';
+    } else {
+        generate_data.custom_include_body = cur + '\nstream_options:\n  include_usage: true';
+    }
+}
+
 // ---------- привязка usage к сообщению / журналу ----------
 
 function onUsage(u, meta) {
-    const { cost, priced } = computeCost(u);
+    const { cost, priced, long, offpeak } = computeCost(u);
     const rec = {
         t: Date.now(),
         model: u.model || meta.model || '?',
@@ -250,6 +314,9 @@ function onUsage(u, meta) {
         cw: u.cw || 0,
         cw5: u.cw5,
         cw1: u.cw1,
+        think: u.think || 0,
+        long: !!long,
+        offpeak: !!offpeak,
         cost,
         priced,
     };
@@ -349,22 +416,49 @@ function pruneLedger() {
 
 // ---------- строка под сообщением ----------
 
+function fmtShort(n) {
+    n = Number(n || 0);
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(2).replace('.', ',') + 'M';
+    if (n >= 10_000) return (n / 1000).toFixed(1).replace('.', ',') + 'k';
+    return fmtInt(n);
+}
+
 function messageLineHtml(u) {
     if (!u) return '';
     const cacheTotal = u.cr + u.cw + u.in;
     const hit = cacheTotal > 0 ? Math.round((u.cr / cacheTotal) * 100) : 0;
+    const hitCls = hit >= 85 ? 'fc-hit-good' : hit >= 50 ? 'fc-hit-mid' : 'fc-hit-bad';
     const costTxt = u.priced ? fmtUsd(u.cost) : '<span class="fc-unpriced" title="Модели нет в таблице цен">цена?</span>';
     const parts = u.parts > 1 ? ` <span class="fc-dim">(${u.parts} части)</span>` : '';
     const ttl = (u.cw5 != null || u.cw1 != null) ? `5м ${fmtInt(u.cw5 || 0)} / 1ч ${fmtInt(u.cw1 || 0)}` : '';
-    const title = `${u.model}\nвход ${fmtInt(u.in)}\nвыход ${fmtInt(u.out)}\nкэш-чтение ${fmtInt(u.cr)}\nкэш-запись ${fmtInt(u.cw)}${ttl ? ' (' + ttl + ')' : ''}\nкэш-хит ${hit}%`;
-    return `<span class="fc-line" title="${escapeHtml(title)}">`
+    const extra = [
+        u.think ? `из них рассуждение ${fmtInt(u.think)}` : '',
+        u.long ? 'тариф длинного контекста' : '',
+        u.offpeak ? 'непиковый тариф' : '',
+    ].filter(Boolean).map((x) => '\n' + x).join('');
+    const title = `${u.model}\nвход ${fmtInt(u.in)}\nвыход ${fmtInt(u.out)}\nкэш-чтение ${fmtInt(u.cr)}\nкэш-запись ${fmtInt(u.cw)}${ttl ? ' (' + ttl + ')' : ''}\nкэш-хит ${hit}%${extra}`;
+    const mode = settings.compactLine || 'auto';
+
+    const full = `<span class="fc-full">`
         + `<span class="fc-model">${escapeHtml(u.model)}</span>`
         + ` <span>вход ${fmtInt(u.in)}</span>`
         + ` <span>выход ${fmtInt(u.out)}</span>`
         + ` <span>кэш ↓${fmtInt(u.cr)} ↑${fmtInt(u.cw)}</span>`
-        + ` <span class="fc-hit ${hit >= 85 ? 'fc-hit-good' : hit >= 50 ? 'fc-hit-mid' : 'fc-hit-bad'}">${hit}%</span>`
+        + ` <span class="fc-hit ${hitCls}">${hit}%</span>`
         + ` <span class="fc-cost">${costTxt}</span>${parts}`
         + '</span>';
+
+    // компакт: без модели, сокращённые числа, переносится, если всё равно не влезает
+    const compact = `<span class="fc-compact">`
+        + `<span>in ${fmtShort(u.in)}</span>`
+        + ` <span>out ${fmtShort(u.out)}</span>`
+        + ` <span>CR ${fmtShort(u.cr)}</span>`
+        + (u.cw ? ` <span>CW ${fmtShort(u.cw)}</span>` : '')
+        + ` <span class="fc-hit ${hitCls}">${hit}%</span>`
+        + ` <span class="fc-cost">${costTxt}</span>`
+        + '</span>';
+
+    return `<span class="fc-line fc-mode-${mode}" title="${escapeHtml(title)}">${full}${compact}</span>`;
 }
 
 function renderMessageLine(id) {
@@ -592,6 +686,14 @@ function addSettingsPanel() {
                     <span class="fc-dim">сегодня: <b id="fc_chip_value">$0</b></span>
                 </div>
                 <label class="checkbox_label"><input type="checkbox" id="fc_show_line"> Строка с токенами и ценой под каждым ответом</label>
+                <label class="fc-row">Подпись под ответом
+                    <select id="fc_compact" class="text_pole fc-select">
+                        <option value="auto">полная, на узком экране компактная</option>
+                        <option value="always">всегда компактная</option>
+                        <option value="never">всегда полная</option>
+                    </select>
+                </label>
+                <label class="checkbox_label"><input type="checkbox" id="fc_inject"> Custom-источник: добавлять <code>stream_options.include_usage</code> (нужно для OpenAI через Custom, NanoGPT и других OpenAI-совместимых)</label>
                 <label class="fc-row">Кэш-запись без разбивки по TTL считать как
                     <select id="fc_ttl" class="text_pole fc-select">
                         <option value="1h">1 час</option>
@@ -613,6 +715,15 @@ function addSettingsPanel() {
         settings.showUnderMessage = this.checked;
         ctx.saveSettingsDebounced();
         renderAllLines();
+    });
+    $('#fc_compact').val(settings.compactLine).on('change', function () {
+        settings.compactLine = this.value;
+        ctx.saveSettingsDebounced();
+        renderAllLines();
+    });
+    $('#fc_inject').prop('checked', settings.injectUsageOption).on('change', function () {
+        settings.injectUsageOption = this.checked;
+        ctx.saveSettingsDebounced();
     });
     $('#fc_ttl').val(settings.defaultTtl).on('change', function () {
         settings.defaultTtl = this.value;
@@ -663,6 +774,7 @@ function init() {
         if (dryRun) return;
         currentGenType = type || 'normal';
     });
+    es.on(et.CHAT_COMPLETION_SETTINGS_READY || 'chat_completion_settings_ready', onSettingsReady);
     es.on(et.MESSAGE_RECEIVED || 'message_received', onMessageReceived);
     es.on(et.CHARACTER_MESSAGE_RENDERED || 'character_message_rendered', (id) => renderMessageLine(Number(id)));
     es.on(et.MESSAGE_SWIPED || 'message_swiped', (id) => setTimeout(() => renderMessageLine(Number(id)), 50));

@@ -1,4 +1,4 @@
-/* Строка под ответом — тихая, серым, в одну линию */
+/* Строка под ответом — тихая, серым */
 .fc-line {
     display: block;
     margin-top: 6px;
@@ -6,11 +6,20 @@
     line-height: 1.5;
     opacity: 0.62;
     letter-spacing: 0.01em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
 }
-.fc-line > span + span::before { content: ' · '; opacity: 0.6; }
+.fc-full, .fc-compact { display: block; }
+.fc-full { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-compact { white-space: normal; }
+.fc-full > span + span::before, .fc-compact > span + span::before { content: ' · '; opacity: 0.6; }
+
+/* какую версию показывать */
+.fc-mode-auto .fc-compact, .fc-mode-never .fc-compact { display: none; }
+.fc-mode-always .fc-full { display: none; }
+@media (max-width: 1000px) {
+    .fc-mode-auto .fc-full { display: none; }
+    .fc-mode-auto .fc-compact { display: block; }
+}
 .fc-line .fc-model { font-variant-numeric: tabular-nums; }
 .fc-line .fc-cost { font-weight: 600; }
 .fc-hit-good { color: #8fd694; }
