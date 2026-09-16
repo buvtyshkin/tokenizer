@@ -10,6 +10,7 @@ const EXTRA_KEY = 'fisher_cost';
 const RAW_KEEP_MS = 48 * 3600 * 1000;      // сырые записи журнала — двое суток
 const DAILY_KEEP_DAYS = 120;               // дневные агрегаты — четыре месяца
 const ATTACH_WAIT_MS = 2500;               // сколько ждём MESSAGE_RECEIVED после конца стрима
+const REFRESH_MAX_TOKENS = 8;              // non-stream запрос с max_tokens не больше этого — пинг кэш-рефрешера
 
 const DEFAULTS = {
     showUnderMessage: true,
@@ -30,6 +31,7 @@ let awaitingMessageId = null;     // MESSAGE_RECEIVED пришёл раньше,
 let currentGenType = null;
 let sessionStart = Date.now();
 let lastNonStreamWarn = 0;
+let lastPromptByChat = {};        // { chatLabel: {model, in, cr, cw} } — размер последнего промпта, для оценки пингов
 
 // ---------- утилиты ----------
 
@@ -145,66 +147,72 @@ function computeCost(u) {
 
 // ---------- разбор стрима ----------
 
+function newUsage(meta) {
+    return { model: meta.model || null, in: 0, out: 0, cr: 0, cw: 0, cw5: null, cw1: null, think: 0, seen: false };
+}
+
+/** Один чанк стрима или целый JSON-ответ → поля usage. Общий для стрима и non-stream. */
+function applyUsage(u, obj) {
+    if (!obj || typeof obj !== 'object') return;
+    // Anthropic
+    if (obj.type === 'message_start' && obj.message) {
+        const mu = obj.message.usage || {};
+        if (obj.message.model) u.model = obj.message.model;
+        u.in = mu.input_tokens ?? u.in;
+        u.cr = mu.cache_read_input_tokens ?? u.cr;
+        u.cw = mu.cache_creation_input_tokens ?? u.cw;
+        if (mu.cache_creation) {
+            u.cw5 = mu.cache_creation.ephemeral_5m_input_tokens ?? 0;
+            u.cw1 = mu.cache_creation.ephemeral_1h_input_tokens ?? 0;
+        }
+        if (mu.output_tokens) u.out = mu.output_tokens;
+        u.seen = true;
+        return;
+    }
+    if (obj.type === 'message_delta' && obj.usage) {
+        const mu = obj.usage;
+        if (mu.output_tokens != null) u.out = mu.output_tokens;
+        if (mu.input_tokens != null) u.in = mu.input_tokens;
+        if (mu.cache_read_input_tokens != null) u.cr = mu.cache_read_input_tokens;
+        if (mu.cache_creation_input_tokens != null) u.cw = mu.cache_creation_input_tokens;
+        u.seen = true;
+        return;
+    }
+    // Google AI Studio / Vertex: usageMetadata в каждом чанке, значения накопительные
+    if (obj.usageMetadata) {
+        const g = obj.usageMetadata;
+        if (obj.modelVersion) u.model = obj.modelVersion;
+        const cached = g.cachedContentTokenCount || 0;
+        if (g.promptTokenCount != null) { u.in = g.promptTokenCount - cached; u.cr = cached; }
+        const cand = g.candidatesTokenCount ?? null;
+        const think = g.thoughtsTokenCount ?? 0;
+        if (cand != null) { u.out = cand + think; u.think = think; }   // thinking у Google оплачивается как выход
+        u.seen = true;
+        return;
+    }
+    // OpenAI-совместимые: OpenAI/NanoGPT/DeepSeek/xAI — obj.usage; Moonshot/Kimi — choices[0].usage
+    const mu = obj.usage || obj.choices?.[0]?.usage;
+    if (mu && (mu.prompt_tokens != null || mu.completion_tokens != null)) {
+        // OpenAI: prompt_tokens_details.cached_tokens; Moonshot: cached_tokens; DeepSeek: prompt_cache_hit_tokens
+        const cached = mu.prompt_tokens_details?.cached_tokens ?? mu.cached_tokens ?? mu.prompt_cache_hit_tokens ?? 0;
+        u.in = (mu.prompt_tokens || 0) - cached;
+        u.cr = cached;
+        u.cw = mu.prompt_tokens_details?.cache_write_tokens ?? u.cw;
+        u.out = mu.completion_tokens || 0;
+        const think = mu.completion_tokens_details?.reasoning_tokens;
+        if (think) u.think = think;   // уже входит в completion_tokens
+        if (obj.model) u.model = obj.model;
+        u.seen = true;
+    }
+}
+
 /** Читает наш экземпляр потока и собирает usage. Не бросает исключений наружу. */
 async function consumeStream(stream, meta) {
     const reader = stream.getReader();
     const dec = new TextDecoder();
     let buf = '';
-    const u = { model: meta.model || null, in: 0, out: 0, cr: 0, cw: 0, cw5: null, cw1: null, think: 0, seen: false };
-
-    const handle = (obj) => {
-        if (!obj || typeof obj !== 'object') return;
-        // Anthropic
-        if (obj.type === 'message_start' && obj.message) {
-            const mu = obj.message.usage || {};
-            if (obj.message.model) u.model = obj.message.model;
-            u.in = mu.input_tokens ?? u.in;
-            u.cr = mu.cache_read_input_tokens ?? u.cr;
-            u.cw = mu.cache_creation_input_tokens ?? u.cw;
-            if (mu.cache_creation) {
-                u.cw5 = mu.cache_creation.ephemeral_5m_input_tokens ?? 0;
-                u.cw1 = mu.cache_creation.ephemeral_1h_input_tokens ?? 0;
-            }
-            if (mu.output_tokens) u.out = mu.output_tokens;
-            u.seen = true;
-            return;
-        }
-        if (obj.type === 'message_delta' && obj.usage) {
-            const mu = obj.usage;
-            if (mu.output_tokens != null) u.out = mu.output_tokens;
-            if (mu.input_tokens != null) u.in = mu.input_tokens;
-            if (mu.cache_read_input_tokens != null) u.cr = mu.cache_read_input_tokens;
-            if (mu.cache_creation_input_tokens != null) u.cw = mu.cache_creation_input_tokens;
-            u.seen = true;
-            return;
-        }
-        // Google AI Studio / Vertex: usageMetadata в каждом чанке, значения накопительные
-        if (obj.usageMetadata) {
-            const g = obj.usageMetadata;
-            if (obj.modelVersion) u.model = obj.modelVersion;
-            const cached = g.cachedContentTokenCount || 0;
-            if (g.promptTokenCount != null) { u.in = g.promptTokenCount - cached; u.cr = cached; }
-            const cand = g.candidatesTokenCount ?? null;
-            const think = g.thoughtsTokenCount ?? 0;
-            if (cand != null) { u.out = cand + think; u.think = think; }   // thinking у Google оплачивается как выход
-            u.seen = true;
-            return;
-        }
-        // OpenAI-совместимые: OpenAI/NanoGPT/DeepSeek/xAI — obj.usage; Moonshot/Kimi — choices[0].usage
-        const mu = obj.usage || obj.choices?.[0]?.usage;
-        if (mu && (mu.prompt_tokens != null || mu.completion_tokens != null)) {
-            // OpenAI: prompt_tokens_details.cached_tokens; Moonshot: cached_tokens; DeepSeek: prompt_cache_hit_tokens
-            const cached = mu.prompt_tokens_details?.cached_tokens ?? mu.cached_tokens ?? mu.prompt_cache_hit_tokens ?? 0;
-            u.in = (mu.prompt_tokens || 0) - cached;
-            u.cr = cached;
-            u.cw = mu.prompt_tokens_details?.cache_write_tokens ?? u.cw;
-            u.out = mu.completion_tokens || 0;
-            const think = mu.completion_tokens_details?.reasoning_tokens;
-            if (think) u.think = think;   // уже входит в completion_tokens
-            if (obj.model) u.model = obj.model;
-            u.seen = true;
-        }
-    };
+    const u = newUsage(meta);
+    const handle = (obj) => applyUsage(u, obj);
 
     try {
         while (true) {
@@ -234,16 +242,16 @@ function installFetchHook() {
         const url = typeof input === 'string' ? input : (input?.url || '');
         if (!url.includes(GENERATE_URL)) return original.apply(this, arguments);
 
-        let meta = { model: null, stream: false, source: null };
+        let meta = { model: null, stream: false, source: null, maxTokens: null };
         try {
             const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
-            if (body) meta = { model: body.model || null, stream: !!body.stream, source: body.chat_completion_source || null };
+            if (body) meta = { model: body.model || null, stream: !!body.stream, source: body.chat_completion_source || null, maxTokens: body.max_tokens ?? null };
         } catch { /* тело не наше дело */ }
 
         const response = await original.apply(this, arguments);
 
         if (!meta.stream) {
-            warnNonStream();
+            if (response.ok) handleNonStream(response.clone(), meta);
             return response;
         }
         if (!response.ok || !response.body) return response;
@@ -267,6 +275,63 @@ function installFetchHook() {
     window.__fisherCostFetchPatched = true;
 }
 
+/** Пинг кэш-рефрешера: non-stream запрос с крошечным max_tokens (Cache-Refresh-SillyTavern шлёт 1). */
+function isRefreshPing(meta) {
+    return !meta.stream && meta.maxTokens != null && meta.maxTokens <= REFRESH_MAX_TOKENS;
+}
+
+/**
+ * Non-stream ответ. Для Custom/OpenAI-совместимых сервер Таверны отдаёт JSON провайдера как есть —
+ * там есть usage, считаем точно. Для Claude и Google сервер разворачивает ответ в {choices,...}
+ * и usage выбрасывает: если это пинг рефрешера — оцениваем по последнему промпту, иначе предупреждаем.
+ */
+async function handleNonStream(cloned, meta) {
+    let json = null;
+    try { json = await cloned.json(); } catch { /* не JSON */ }
+    const u = newUsage(meta);
+    if (json) {
+        applyUsage(u, json);
+        // Google non-stream без обёртки (на всякий случай) — usageMetadata на верхнем уровне
+        if (!u.seen && json.usageMetadata) applyUsage(u, { usageMetadata: json.usageMetadata, modelVersion: json.modelVersion });
+    }
+    if (u.seen) {
+        if (isRefreshPing(meta)) recordRefresh(u, meta, false);
+        else onUsage(u, meta);
+        return;
+    }
+    if (isRefreshPing(meta)) {
+        recordRefresh(estimateRefresh(meta), meta, true);
+        return;
+    }
+    warnNonStream();
+}
+
+/**
+ * Оценка пинга без usage: промпт тот же, что у последнего ответа в этом чате.
+ * Google (неявный кэш): весь промпт по цене чтения кэша. Anthropic и прочие с точками кэша:
+ * cr+cw по цене чтения, in (хвост за точкой) по полной. Выход — max_tokens пинга.
+ */
+function estimateRefresh(meta) {
+    const u = newUsage(meta);
+    const lp = lastPromptByChat[chatLabel()];
+    if (!lp) return u;   // seen=false → запись без цены, только счётчик
+    u.model = lp.model || u.model;
+    const google = meta.source === 'makersuite' || meta.source === 'vertexai';
+    if (google) { u.cr = lp.in + lp.cr + lp.cw; u.in = 0; }
+    else { u.cr = lp.cr + lp.cw; u.in = lp.in; }
+    u.cw = 0; u.cw5 = 0; u.cw1 = 0;
+    u.out = Math.max(1, meta.maxTokens || 1);
+    u.seen = true;
+    return u;
+}
+
+function recordRefresh(u, meta, estimated) {
+    const { cost, priced } = u.seen ? computeCost(u) : { cost: null, priced: false };
+    const rec = { t: Date.now(), model: u.model || meta.model || '?', in: u.in || 0, out: u.out || 0, cr: u.cr || 0, cw: u.cw || 0, cost, priced, est: !!estimated };
+    recordLedger(rec, 'refresh', 'refresh');
+    console.log(`${LOG} пинг кэш-рефрешера${estimated ? ' (оценка)' : ''}`, rec);
+}
+
 let lastNoUsageWarn = 0;
 function warnNoUsage(meta) {
     const now = Date.now();
@@ -282,7 +347,7 @@ function warnNonStream() {
     const now = Date.now();
     if (now - lastNonStreamWarn < 60_000) return;
     lastNonStreamWarn = now;
-    toastr.info('Fisher Cost: стриминг выключен — сервер Таверны выбрасывает usage, стоимость не посчитана.', '', { timeOut: 8000 });
+    toastr.info('Fisher Cost: запрос без стриминга — сервер Таверны выбрасывает usage, стоимость не посчитана.', '', { timeOut: 8000 });
 }
 
 /** Custom-источник (Moonshot, NanoGPT и т.п.): просим usage в последнем чанке стрима. */
@@ -320,6 +385,8 @@ function onUsage(u, meta) {
         cost,
         priced,
     };
+
+    lastPromptByChat[chatLabel()] = { model: rec.model, in: rec.in, cr: rec.cr, cw: rec.cw };
 
     if (awaitingMessageId != null) {
         const id = awaitingMessageId;
@@ -389,12 +456,15 @@ function attachToMessage(id, rec) {
 
 function recordLedger(rec, kind, genType) {
     const chat = chatLabel();
-    const entry = { t: rec.t, chat, model: rec.model, kind, gen: genType || null, in: rec.in, out: rec.out, cr: rec.cr, cw: rec.cw, cost: rec.cost, priced: rec.priced };
+    const entry = { t: rec.t, chat, model: rec.model, kind, gen: genType || null, in: rec.in, out: rec.out, cr: rec.cr, cw: rec.cw, cost: rec.cost, priced: rec.priced, est: !!rec.est };
     settings.raw.push(entry);
 
     const key = `${dayKey(rec.t)}|${chat}|${rec.model}`;
-    const d = settings.daily[key] || (settings.daily[key] = { day: dayKey(rec.t), chat, model: rec.model, n: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svc: 0, svcCost: 0, unpriced: 0 });
-    if (kind === 'message') d.n += 1; else { d.svc += 1; d.svcCost += rec.cost || 0; }
+    const d = settings.daily[key] || (settings.daily[key] = { day: dayKey(rec.t), chat, model: rec.model, n: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svc: 0, svcCost: 0, ref: 0, refCost: 0, unpriced: 0 });
+    d.ref = d.ref || 0; d.refCost = d.refCost || 0;   // записи, созданные до появления рефреш-счётчика
+    if (kind === 'message') d.n += 1;
+    else if (kind === 'refresh') { d.ref += 1; d.refCost += rec.cost || 0; }
+    else { d.svc += 1; d.svcCost += rec.cost || 0; }
     d.in += rec.in; d.out += rec.out; d.cr += rec.cr; d.cw += rec.cw;
     d.cost += rec.cost || 0;
     if (!rec.priced) d.unpriced += 1;
@@ -485,10 +555,12 @@ function renderAllLines() {
 // ---------- отчёт ----------
 
 function sumRaw(since) {
-    const acc = { n: 0, svc: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, unpriced: 0 };
+    const acc = { n: 0, svc: 0, ref: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, refCost: 0, unpriced: 0 };
     for (const e of settings.raw) {
         if (e.t < since) continue;
-        if (e.kind === 'message') acc.n++; else { acc.svc++; acc.svcCost += e.cost || 0; }
+        if (e.kind === 'message') acc.n++;
+        else if (e.kind === 'refresh') { acc.ref++; acc.refCost += e.cost || 0; }
+        else { acc.svc++; acc.svcCost += e.cost || 0; }
         acc.in += e.in; acc.out += e.out; acc.cr += e.cr; acc.cw += e.cw; acc.cost += e.cost || 0;
         if (!e.priced) acc.unpriced++;
     }
@@ -497,17 +569,18 @@ function sumRaw(since) {
 
 function sumDaily(days) {
     const cutoff = dayKey(Date.now() - (days - 1) * 86400 * 1000);
-    const acc = { n: 0, svc: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, unpriced: 0 };
+    const acc = { n: 0, svc: 0, ref: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, refCost: 0, unpriced: 0 };
     const byChat = {};
     const byModel = {};
     for (const d of Object.values(settings.daily)) {
         if (d.day < cutoff) continue;
-        acc.n += d.n; acc.svc += d.svc; acc.in += d.in; acc.out += d.out; acc.cr += d.cr; acc.cw += d.cw;
-        acc.cost += d.cost; acc.svcCost += d.svcCost; acc.unpriced += d.unpriced;
-        const c = byChat[d.chat] || (byChat[d.chat] = { n: 0, svc: 0, cost: 0, in: 0, out: 0, cr: 0, cw: 0 });
-        c.n += d.n; c.svc += d.svc; c.cost += d.cost; c.in += d.in; c.out += d.out; c.cr += d.cr; c.cw += d.cw;
+        const ref = d.ref || 0, refCost = d.refCost || 0;
+        acc.n += d.n; acc.svc += d.svc; acc.ref += ref; acc.in += d.in; acc.out += d.out; acc.cr += d.cr; acc.cw += d.cw;
+        acc.cost += d.cost; acc.svcCost += d.svcCost; acc.refCost += refCost; acc.unpriced += d.unpriced;
+        const c = byChat[d.chat] || (byChat[d.chat] = { n: 0, svc: 0, ref: 0, cost: 0, refCost: 0, in: 0, out: 0, cr: 0, cw: 0 });
+        c.n += d.n; c.svc += d.svc; c.ref += ref; c.cost += d.cost; c.refCost += refCost; c.in += d.in; c.out += d.out; c.cr += d.cr; c.cw += d.cw;
         const m = byModel[d.model] || (byModel[d.model] = { n: 0, cost: 0 });
-        m.n += d.n + d.svc; m.cost += d.cost;
+        m.n += d.n + d.svc + ref; m.cost += d.cost;
     }
     return { acc, byChat, byModel };
 }
@@ -530,7 +603,7 @@ function periodRow(label, a, note) {
     return `<tr>
         <td class="fc-lbl">${label}</td>
         <td class="fc-num"><b>${fmtUsd(a.cost)}</b>${a.unpriced ? ` <span class="fc-unpriced" title="${a.unpriced} ответов без цены">*</span>` : ''}</td>
-        <td class="fc-num">${fmtInt(a.n)}${a.svc ? ` <span class="fc-dim">+${fmtInt(a.svc)} служ. (${fmtUsd(a.svcCost)})</span>` : ''}</td>
+        <td class="fc-num">${fmtInt(a.n)}${a.svc ? ` <span class="fc-dim">+${fmtInt(a.svc)} служ. (${fmtUsd(a.svcCost)})</span>` : ''}${a.ref ? ` <span class="fc-dim" title="пинги кэш-рефрешера; для Claude и Google стоимость оценочная — сервер Таверны не отдаёт usage без стриминга">+${fmtInt(a.ref)} рефреш (≈${fmtUsd(a.refCost)})</span>` : ''}</td>
         <td class="fc-num">${fmtInt(a.in)}</td>
         <td class="fc-num">${fmtInt(a.out)}</td>
         <td class="fc-num">${fmtInt(a.cr)}</td>
@@ -556,7 +629,7 @@ function buildReportHtml(days) {
         ? chats.map(([name, c]) => `<tr>
             <td class="fc-lbl">${escapeHtml(name)}</td>
             <td class="fc-num"><b>${fmtUsd(c.cost)}</b></td>
-            <td class="fc-num">${fmtInt(c.n)}${c.svc ? ` <span class="fc-dim">+${c.svc}</span>` : ''}</td>
+            <td class="fc-num">${fmtInt(c.n)}${c.svc ? ` <span class="fc-dim">+${c.svc}</span>` : ''}${c.ref ? ` <span class="fc-dim" title="пинги кэш-рефрешера, ≈${fmtUsd(c.refCost)}">+${c.ref}↻</span>` : ''}</td>
             <td class="fc-num">${c.n ? fmtUsd(c.cost / c.n) : '—'}</td>
             <td class="fc-num">${fmtInt(c.in)}</td>
             <td class="fc-num">${fmtInt(c.out)}</td>
@@ -657,9 +730,9 @@ function updateChip() {
 }
 
 function exportCsv() {
-    const rows = [['day', 'chat', 'model', 'messages', 'service', 'input', 'output', 'cache_read', 'cache_write', 'cost_usd', 'service_cost_usd', 'unpriced']];
+    const rows = [['day', 'chat', 'model', 'messages', 'service', 'refresh', 'input', 'output', 'cache_read', 'cache_write', 'cost_usd', 'service_cost_usd', 'refresh_cost_usd', 'unpriced']];
     for (const d of Object.values(settings.daily).sort((a, b) => a.day.localeCompare(b.day))) {
-        rows.push([d.day, d.chat, d.model, d.n, d.svc, d.in, d.out, d.cr, d.cw, d.cost.toFixed(6), d.svcCost.toFixed(6), d.unpriced]);
+        rows.push([d.day, d.chat, d.model, d.n, d.svc, d.ref || 0, d.in, d.out, d.cr, d.cw, d.cost.toFixed(6), d.svcCost.toFixed(6), (d.refCost || 0).toFixed(6), d.unpriced]);
     }
     const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
