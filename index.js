@@ -14,6 +14,8 @@ const REFRESH_MAX_TOKENS = 8;              // non-stream запрос с max_tok
 
 const DEFAULTS = {
     showUnderMessage: true,
+    showTopbar: true,          // строка с разбивкой промпта над чатом
+    showMessageTokens: true,   // счётчик токенов у каждого сообщения
     compactLine: 'auto',       // 'auto' — компактно на узких экранах, 'always', 'never'
     injectUsageOption: true,   // Custom-источник: добавлять stream_options.include_usage
     defaultTtl: '1h',          // если API не прислал разбивку cache_creation по TTL
@@ -493,8 +495,20 @@ function fmtShort(n) {
     return fmtInt(n);
 }
 
-function messageLineHtml(u) {
-    if (!u) return '';
+function messageLineHtml(u, tok) {
+    const mode = settings.compactLine || 'auto';
+    const tokFull = tok != null
+        ? `<span class="fc-tok" title="Токенов в тексте сообщения, count_tokens">${fmtInt(tok)} тк</span>`
+        : '';
+    const tokCompact = tok != null ? `<span class="fc-tok">${fmtShort(tok)} тк</span>` : '';
+    if (!u) {
+        // Своё сообщение или старое, без данных usage — показываем только токены.
+        if (tok == null) return '';
+        return `<span class="fc-line fc-mode-${mode}">`
+            + `<span class="fc-full">${tokFull}</span>`
+            + `<span class="fc-compact">${tokCompact}</span>`
+            + '</span>';
+    }
     const cacheTotal = u.cr + u.cw + u.in;
     const hit = cacheTotal > 0 ? Math.round((u.cr / cacheTotal) * 100) : 0;
     const hitCls = hit >= 85 ? 'fc-hit-good' : hit >= 50 ? 'fc-hit-mid' : 'fc-hit-bad';
@@ -507,7 +521,6 @@ function messageLineHtml(u) {
         u.offpeak ? 'непиковый тариф' : '',
     ].filter(Boolean).map((x) => '\n' + x).join('');
     const title = `${u.model}\nвход ${fmtInt(u.in)}\nвыход ${fmtInt(u.out)}\nкэш-чтение ${fmtInt(u.cr)}\nкэш-запись ${fmtInt(u.cw)}${ttl ? ' (' + ttl + ')' : ''}\nкэш-хит ${hit}%${extra}`;
-    const mode = settings.compactLine || 'auto';
 
     const full = `<span class="fc-full">`
         + `<span class="fc-model">${escapeHtml(u.model)}</span>`
@@ -516,6 +529,7 @@ function messageLineHtml(u) {
         + ` <span>кэш ↓${fmtInt(u.cr)} ↑${fmtInt(u.cw)}</span>`
         + ` <span class="fc-hit ${hitCls}">${hit}%</span>`
         + ` <span class="fc-cost">${costTxt}</span>${parts}`
+        + (tokFull ? ' ' + tokFull : '')
         + '</span>';
 
     // компакт: без модели, сокращённые числа, переносится, если всё равно не влезает
@@ -526,6 +540,7 @@ function messageLineHtml(u) {
         + (u.cw ? ` <span>CW ${fmtShort(u.cw)}</span>` : '')
         + ` <span class="fc-hit ${hitCls}">${hit}%</span>`
         + ` <span class="fc-cost">${costTxt}</span>`
+        + (tokCompact ? ' ' + tokCompact : '')
         + '</span>';
 
     return `<span class="fc-line fc-mode-${mode}" title="${escapeHtml(title)}">${full}${compact}</span>`;
@@ -539,9 +554,10 @@ function renderMessageLine(id) {
     $mes.find('.fc-line').remove();
     if (!settings.showUnderMessage) return;
     const u = mes?.extra?.[EXTRA_KEY];
-    if (!u) return;
+    const tok = settings.showMessageTokens ? messageTokens(id) : null;
+    if (!u && tok == null) return;
     const $anchor = $mes.find('.mes_text').first();
-    if ($anchor.length) $anchor.after(messageLineHtml(u));
+    if ($anchor.length) $anchor.after(messageLineHtml(u, tok));
 }
 
 function renderAllLines() {
@@ -550,6 +566,7 @@ function renderAllLines() {
         const id = Number($(this).attr('mesid'));
         if (Number.isFinite(id) && chat[id]) renderMessageLine(id);
     });
+    scheduleMessageCounts();
 }
 
 // ---------- отчёт ----------
@@ -759,6 +776,9 @@ function addSettingsPanel() {
                     <span class="fc-dim">сегодня: <b id="fc_chip_value">$0</b></span>
                 </div>
                 <label class="checkbox_label"><input type="checkbox" id="fc_show_line"> Строка с токенами и ценой под каждым ответом</label>
+                <label class="checkbox_label"><input type="checkbox" id="fc_topbar"> Разбивка промпта над чатом: чат, лорбук, промпт, карточка, персона</label>
+                <label class="checkbox_label"><input type="checkbox" id="fc_msgtok"> Токены самого сообщения в строке под ним</label>
+                <div class="fc-dim">Считает серверный плагин <code>fisher-tokens</code> через настоящий <code>count_tokens</code>. Чат — без скрытых сообщений. Каждое сообщение считается один раз и запоминается в файле чата.</div>
                 <label class="fc-row">Подпись под ответом
                     <select id="fc_compact" class="text_pole fc-select">
                         <option value="auto">полная, на узком экране компактная</option>
@@ -786,6 +806,17 @@ function addSettingsPanel() {
 
     $('#fc_show_line').prop('checked', settings.showUnderMessage).on('change', function () {
         settings.showUnderMessage = this.checked;
+        ctx.saveSettingsDebounced();
+        renderAllLines();
+    });
+    $('#fc_topbar').prop('checked', settings.showTopbar).on('change', function () {
+        settings.showTopbar = this.checked;
+        ctx.saveSettingsDebounced();
+        renderTopbar();
+        if (this.checked) scheduleBreakdown();
+    });
+    $('#fc_msgtok').prop('checked', settings.showMessageTokens).on('change', function () {
+        settings.showMessageTokens = this.checked;
         ctx.saveSettingsDebounced();
         renderAllLines();
     });
@@ -823,6 +854,244 @@ function addSettingsPanel() {
 
 // ---------- запуск ----------
 
+// ---------- разбивка промпта по секциям ----------
+// Таверна считает все модели Claude одним замороженным tokenizers/claude.json,
+// который разошёлся с настоящим токенизатором ещё на Opus 4.7. Здесь секции и
+// сообщения считает серверный плагин fisher-tokens через count_tokens, то есть
+// тем же токенизатором, каким считает сама модель.
+
+const COUNT_URL = '/api/plugins/fisher-tokens/count';
+const TOPBAR_ID = 'fc-topbar';
+const MSG_KEY = 'fisher_tokens';
+const MSG_BATCH = 6;            // сообщений за один заход очереди
+const MSG_TICK_MS = 1200;       // пауза между заходами — бережём лимит запросов
+const BREAKDOWN_DEBOUNCE_MS = 800;
+
+const SECTIONS = [
+    { key: 'chat', full: 'чат', short: 'чат' },
+    { key: 'lorebook', full: 'лорбук', short: 'лор' },
+    { key: 'prompt', full: 'промпт', short: 'пр' },
+    { key: 'card', full: 'карточка', short: 'крт' },
+    { key: 'persona', full: 'персона', short: 'прс' },
+];
+
+let wiActivated = [];           // записи лорбука, сработавшие на последней генерации
+let breakdown = null;
+let breakdownErr = null;
+let breakdownBusy = false;
+let breakdownTimer = null;
+let msgQueue = [];
+let msgTimer = null;
+let msgDirty = false;
+
+function currentModel() {
+    const o = ctx?.oai_settings || {};
+    return String(o.claude_model || o.openai_model || o.custom_model || '');
+}
+
+async function countBlocks(blocks) {
+    const headers = ctx.getRequestHeaders
+        ? ctx.getRequestHeaders()
+        : { 'Content-Type': 'application/json' };
+    const res = await fetch(COUNT_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: currentModel(), blocks }),
+    });
+    if (res.status === 404) throw new Error('серверный плагин fisher-tokens не установлен или плагины выключены');
+    if (!res.ok) throw new Error(`плагин ответил HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return data;
+}
+
+/** Видимая часть чата: /hide помечает сообщения флагом is_system. */
+function visibleChatText() {
+    return (ctx?.chat || [])
+        .filter((m) => m && !m.is_system && typeof m.mes === 'string')
+        .map((m) => `${m.name || ''}: ${m.mes}`)
+        .join('\n\n');
+}
+
+function cardText() {
+    const c = ctx?.characters?.[ctx.characterId];
+    if (!c) return '';
+    return [c.description, c.personality, c.scenario, c.mes_example].filter(Boolean).join('\n\n');
+}
+
+function personaText() {
+    const pu = ctx?.powerUserSettings || {};
+    return String(pu.persona_description || '');
+}
+
+/** Включённые текстовые блоки пресета. Маркеры пропускаем — их содержимое
+ *  (карточка, персона, история) считается отдельными секциями. */
+function promptText() {
+    const o = ctx?.oai_settings || {};
+    const prompts = Array.isArray(o.prompts) ? o.prompts : [];
+    const orders = Array.isArray(o.prompt_order) ? o.prompt_order : [];
+    const order = orders.length
+        ? (orders.find((x) => Number(x.character_id) === 100001) || orders[orders.length - 1])
+        : null;
+    const enabled = new Map();
+    for (const item of (order?.order || [])) {
+        enabled.set(String(item.identifier), item.enabled !== false);
+    }
+    return prompts
+        .filter((p) => p && !p.marker && typeof p.content === 'string' && p.content.trim())
+        .filter((p) => enabled.size === 0 || enabled.get(String(p.identifier)) !== false)
+        .map((p) => p.content)
+        .join('\n\n');
+}
+
+function lorebookText() {
+    return wiActivated.map((e) => String(e?.content || '')).filter(Boolean).join('\n\n');
+}
+
+function scheduleBreakdown() {
+    if (!settings.showTopbar) return;
+    clearTimeout(breakdownTimer);
+    breakdownTimer = setTimeout(refreshBreakdown, BREAKDOWN_DEBOUNCE_MS);
+}
+
+async function refreshBreakdown() {
+    if (!settings.showTopbar || breakdownBusy) return;
+    if (!currentModel()) { breakdownErr = 'модель не выбрана'; renderTopbar(); return; }
+    breakdownBusy = true;
+    try {
+        const { counts, errors } = await countBlocks([
+            { key: 'chat', text: visibleChatText() },
+            { key: 'lorebook', text: lorebookText() },
+            { key: 'prompt', text: promptText() },
+            { key: 'card', text: cardText() },
+            { key: 'persona', text: personaText() },
+        ]);
+        breakdown = counts;
+        const firstError = Object.values(errors || {})[0];
+        breakdownErr = firstError || null;
+    } catch (e) {
+        breakdownErr = String(e.message || e);
+    } finally {
+        breakdownBusy = false;
+        renderTopbar();
+    }
+}
+
+function topbarHtml() {
+    if (!breakdown && breakdownErr) {
+        return `<span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">счётчик недоступен</span>`;
+    }
+    if (!breakdown) return '<span class="fc-dim">считаю…</span>';
+
+    const total = SECTIONS.reduce((s, x) => s + (breakdown[x.key] || 0), 0);
+    const cell = (label, value, extra) =>
+        `<span class="fc-tb-cell${extra ? ' ' + extra : ''}">`
+        + `<span class="fc-tb-l">${label}</span><span class="fc-tb-v">${value}</span></span>`;
+
+    const full = '<span class="fc-tb-full">'
+        + SECTIONS.map((s) => cell(s.full, fmtInt(breakdown[s.key] || 0))).join('')
+        + cell('всего', fmtInt(total), 'fc-tb-total')
+        + '</span>';
+    const compact = '<span class="fc-tb-compact">'
+        + SECTIONS.map((s) => cell(s.short, fmtShort(breakdown[s.key] || 0))).join('')
+        + cell('Σ', fmtShort(total), 'fc-tb-total')
+        + '</span>';
+
+    const warn = breakdownErr
+        ? ` <span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">!</span>`
+        : '';
+    return full + compact + warn;
+}
+
+function renderTopbar() {
+    if (!settings?.showTopbar) { $('#' + TOPBAR_ID).remove(); return; }
+    let $bar = $('#' + TOPBAR_ID);
+    if (!$bar.length) {
+        const $chat = $('#chat');
+        if (!$chat.length) return;
+        $chat.before(`<div id="${TOPBAR_ID}" class="fc-topbar fc-mode-${settings.compactLine || 'auto'}" title="Точный подсчёт через count_tokens. Чат — без скрытых сообщений."></div>`);
+        $bar = $('#' + TOPBAR_ID);
+    }
+    $bar.attr('class', `fc-topbar fc-mode-${settings.compactLine || 'auto'}`);
+    $bar.html(topbarHtml());
+}
+
+// ---------- токены отдельного сообщения ----------
+
+/** Дешёвый устойчивый хеш: пересчитываем сообщение, только если текст изменился. */
+function textHash(text) {
+    let h = 5381;
+    for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+    return `${text.length}:${h}`;
+}
+
+function messageTokens(id) {
+    const mes = ctx?.chat?.[id];
+    if (!mes || typeof mes.mes !== 'string') return null;
+    const rec = mes.extra?.[MSG_KEY];
+    return (rec && rec.h === textHash(mes.mes)) ? rec.n : null;
+}
+
+/** Сообщения на экране, у которых ещё нет свежего счёта. */
+function collectUncounted() {
+    if (!settings.showMessageTokens) return [];
+    const chat = ctx?.chat || [];
+    const ids = [];
+    $('#chat .mes').each(function () {
+        const id = Number($(this).attr('mesid'));
+        if (!Number.isFinite(id)) return;
+        const mes = chat[id];
+        if (!mes || typeof mes.mes !== 'string' || !mes.mes.trim()) return;
+        if (messageTokens(id) === null) ids.push(id);
+    });
+    return ids;
+}
+
+function scheduleMessageCounts() {
+    if (!settings.showMessageTokens || msgTimer) return;
+    msgTimer = setTimeout(async () => {
+        msgTimer = null;
+        await processMessageQueue();
+    }, 300);
+}
+
+async function processMessageQueue() {
+    if (!settings.showMessageTokens || !currentModel()) return;
+    msgQueue = collectUncounted();
+    if (!msgQueue.length) {
+        if (msgDirty) { msgDirty = false; try { ctx.saveChat?.(); } catch { /* сохранится позже */ } }
+        return;
+    }
+
+    const chat = ctx?.chat || [];
+    const batch = msgQueue.slice(0, MSG_BATCH);
+    const blocks = batch.map((id) => ({ key: String(id), text: chat[id].mes }));
+
+    try {
+        const { counts } = await countBlocks(blocks);
+        for (const id of batch) {
+            const n = counts[String(id)];
+            if (typeof n !== 'number') continue;
+            const mes = chat[id];
+            if (!mes) continue;
+            mes.extra = mes.extra || {};
+            mes.extra[MSG_KEY] = { n, h: textHash(mes.mes) };
+            msgDirty = true;
+            renderMessageLine(id);
+        }
+    } catch (e) {
+        console.warn(`${LOG} подсчёт сообщений: ${e.message || e}`);
+        return;   // не долбим сервер в цикле, если он отвечает ошибкой
+    }
+
+    if (collectUncounted().length) {
+        msgTimer = setTimeout(async () => { msgTimer = null; await processMessageQueue(); }, MSG_TICK_MS);
+    } else if (msgDirty) {
+        msgDirty = false;
+        try { ctx.saveChat?.(); } catch { /* сохранится позже */ }
+    }
+}
+
 function init() {
     try {
         ctx = SillyTavern.getContext();
@@ -854,9 +1123,22 @@ function init() {
     es.on(et.MESSAGE_UPDATED || 'message_updated', (id) => setTimeout(() => renderMessageLine(Number(id)), 50));
     es.on(et.CHAT_CHANGED || 'chat_id_changed', () => setTimeout(renderAllLines, 100));
     es.on(et.MORE_MESSAGES_LOADED || 'more_messages_loaded', () => setTimeout(renderAllLines, 100));
+    es.on(et.WORLD_INFO_ACTIVATED || 'world_info_activated', (entries) => {
+        wiActivated = Array.isArray(entries) ? entries : [];
+        scheduleBreakdown();
+    });
+    es.on(et.MESSAGE_SENT || 'message_sent', () => { scheduleBreakdown(); scheduleMessageCounts(); });
+    es.on(et.MESSAGE_RECEIVED || 'message_received', () => scheduleBreakdown());
+    es.on(et.CHAT_CHANGED || 'chat_id_changed', () => {
+        // Лорбук пересобирается на следующей генерации, счёт чата — сразу.
+        wiActivated = [];
+        breakdown = null;
+        setTimeout(() => { renderTopbar(); scheduleBreakdown(); }, 200);
+    });
 
     addSettingsPanel();
     setTimeout(renderAllLines, 500);
+    setTimeout(() => { renderTopbar(); scheduleBreakdown(); }, 900);
     console.log(`${LOG} загружен. Стриминг обязателен: usage читается из потока ответа.`);
 }
 

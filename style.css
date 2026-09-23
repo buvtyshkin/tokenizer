@@ -70,3 +70,45 @@
 .fc-actions { display: flex; gap: 8px; margin-top: 12px; }
 .fc-foot { margin-top: 10px; font-size: 0.85em; }
 .fc-report .fc-select { width: auto; font-size: 0.85em; }
+
+/* Строка разбивки промпта над чатом */
+.fc-topbar {
+    flex: 0 0 auto;
+    margin: 0 auto 4px;
+    padding: 3px 8px;
+    max-width: var(--sheldWidth, 100%);
+    font-size: 0.72em;
+    line-height: 1.5;
+    opacity: 0.68;
+    letter-spacing: 0.01em;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+}
+.fc-topbar .fc-tb-full, .fc-topbar .fc-tb-compact {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 2px 10px;
+}
+.fc-tb-cell { white-space: nowrap; }
+.fc-tb-l { opacity: 0.65; margin-right: 4px; }
+.fc-tb-v { font-weight: 600; }
+.fc-tb-total .fc-tb-v { color: var(--SmartThemeQuoteColor, inherit); }
+.fc-tb-err { color: #e2c46b; cursor: help; }
+
+/* Полная и компактная версии — тот же переключатель, что у строки под ответом */
+.fc-topbar .fc-tb-compact { display: none; }
+.fc-topbar.fc-mode-always .fc-tb-full { display: none; }
+.fc-topbar.fc-mode-always .fc-tb-compact { display: flex; }
+@media (max-width: 1000px) {
+    .fc-topbar.fc-mode-auto .fc-tb-full { display: none; }
+    .fc-topbar.fc-mode-auto .fc-tb-compact { display: flex; }
+}
+@media (max-width: 500px) {
+    .fc-topbar { font-size: 0.68em; padding: 2px 6px; }
+    .fc-topbar .fc-tb-full, .fc-topbar .fc-tb-compact { gap: 1px 8px; }
+}
+
+/* Токены самого сообщения — в той же строке, что и стоимость */
+.fc-tok { opacity: 0.85; }
