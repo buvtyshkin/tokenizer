@@ -885,7 +885,13 @@ let msgTimer = null;
 let msgDirty = false;
 
 function currentModel() {
-    const o = ctx?.oai_settings || {};
+    // Контекст отдаёт настройки как chatCompletionSettings, а готовая функция
+    // сама разбирается, какое поле модели относится к активному источнику.
+    try {
+        const m = ctx?.getChatCompletionModel?.();
+        if (m) return String(m);
+    } catch { /* источник без модели — пробуем настройки напрямую */ }
+    const o = ctx?.chatCompletionSettings || {};
     return String(o.claude_model || o.openai_model || o.custom_model || '');
 }
 
@@ -927,7 +933,7 @@ function personaText() {
 /** Включённые текстовые блоки пресета. Маркеры пропускаем — их содержимое
  *  (карточка, персона, история) считается отдельными секциями. */
 function promptText() {
-    const o = ctx?.oai_settings || {};
+    const o = ctx?.chatCompletionSettings || {};
     const prompts = Array.isArray(o.prompts) ? o.prompts : [];
     const orders = Array.isArray(o.prompt_order) ? o.prompt_order : [];
     const order = orders.length
