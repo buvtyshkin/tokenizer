@@ -108,7 +108,14 @@ function findPrice(model) {
     let best = null;
     for (const key of Object.keys(pricing)) {
         const k = key.toLowerCase();
-        if (m.startsWith(k) && (!best || k.length > best.length)) best = k;
+        if (!m.startsWith(k)) continue;
+        // Хвост после совпадения допустим только датированный: claude-opus-4-5
+        // покрывает claude-opus-4-5-20251101, но claude-opus-5 не должен молча
+        // отдавать свои цены модели claude-opus-5-5. Лучше честное «цена?»,
+        // чем правдоподобное, но неверное число.
+        const tail = m.slice(k.length);
+        if (tail && !/^[-@]\d{6,8}$/.test(tail)) continue;
+        if (!best || k.length > best.length) best = k;
     }
     if (!best) return null;
     return pricing[Object.keys(pricing).find((k) => k.toLowerCase() === best)];
