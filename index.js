@@ -860,6 +860,13 @@ function addSettingsPanel() {
 // сообщения считает серверный плагин fisher-tokens через count_tokens, то есть
 // тем же токенизатором, каким считает сама модель.
 
+/** Контекст пересобирается на каждый вызов: в нём лежит снимок текущих
+ *  значений, поэтому кэшировать его нельзя — characterId и прочие примитивы
+ *  застынут на моменте загрузки страницы. */
+function C() {
+    return SillyTavern.getContext();
+}
+
 const COUNT_URL = '/api/plugins/fisher-tokens/count';
 const TOPBAR_ID = 'fc-topbar';
 const MSG_KEY = 'fisher_tokens';
@@ -888,16 +895,16 @@ function currentModel() {
     // Контекст отдаёт настройки как chatCompletionSettings, а готовая функция
     // сама разбирается, какое поле модели относится к активному источнику.
     try {
-        const m = ctx?.getChatCompletionModel?.();
+        const m = C().getChatCompletionModel?.();
         if (m) return String(m);
     } catch { /* источник без модели — пробуем настройки напрямую */ }
-    const o = ctx?.chatCompletionSettings || {};
+    const o = C().chatCompletionSettings || {};
     return String(o.claude_model || o.openai_model || o.custom_model || '');
 }
 
 async function countBlocks(blocks) {
-    const headers = ctx.getRequestHeaders
-        ? ctx.getRequestHeaders()
+    const headers = C().getRequestHeaders
+        ? C().getRequestHeaders()
         : { 'Content-Type': 'application/json' };
     const res = await fetch(COUNT_URL, {
         method: 'POST',
@@ -913,27 +920,32 @@ async function countBlocks(blocks) {
 
 /** Видимая часть чата: /hide помечает сообщения флагом is_system. */
 function visibleChatText() {
-    return (ctx?.chat || [])
+    return (C().chat || [])
         .filter((m) => m && !m.is_system && typeof m.mes === 'string')
         .map((m) => `${m.name || ''}: ${m.mes}`)
         .join('\n\n');
 }
 
 function cardText() {
-    const c = ctx?.characters?.[ctx.characterId];
+    const ctxNow = C();
+    const c = ctxNow.characters?.[ctxNow.characterId];
     if (!c) return '';
-    return [c.description, c.personality, c.scenario, c.mes_example].filter(Boolean).join('\n\n');
+    // Карточки V2/V3 держат поля в data; Таверна дублирует их наверх, но не всегда.
+    const pick = (k) => String(c[k] || c.data?.[k] || '');
+    return [pick('description'), pick('personality'), pick('scenario'), pick('mes_example')]
+        .filter(Boolean)
+        .join('\n\n');
 }
 
 function personaText() {
-    const pu = ctx?.powerUserSettings || {};
+    const pu = C().powerUserSettings || {};
     return String(pu.persona_description || '');
 }
 
 /** Включённые текстовые блоки пресета. Маркеры пропускаем — их содержимое
  *  (карточка, персона, история) считается отдельными секциями. */
 function promptText() {
-    const o = ctx?.chatCompletionSettings || {};
+    const o = C().chatCompletionSettings || {};
     const prompts = Array.isArray(o.prompts) ? o.prompts : [];
     const orders = Array.isArray(o.prompt_order) ? o.prompt_order : [];
     const order = orders.length
@@ -1032,7 +1044,7 @@ function textHash(text) {
 }
 
 function messageTokens(id) {
-    const mes = ctx?.chat?.[id];
+    const mes = C().chat?.[id];
     if (!mes || typeof mes.mes !== 'string') return null;
     const rec = mes.extra?.[MSG_KEY];
     return (rec && rec.h === textHash(mes.mes)) ? rec.n : null;
@@ -1041,7 +1053,7 @@ function messageTokens(id) {
 /** Сообщения на экране, у которых ещё нет свежего счёта. */
 function collectUncounted() {
     if (!settings.showMessageTokens) return [];
-    const chat = ctx?.chat || [];
+    const chat = C().chat || [];
     const ids = [];
     $('#chat .mes').each(function () {
         const id = Number($(this).attr('mesid'));
@@ -1065,11 +1077,11 @@ async function processMessageQueue() {
     if (!settings.showMessageTokens || !currentModel()) return;
     msgQueue = collectUncounted();
     if (!msgQueue.length) {
-        if (msgDirty) { msgDirty = false; try { ctx.saveChat?.(); } catch { /* сохранится позже */ } }
+        if (msgDirty) { msgDirty = false; try { C().saveChat?.(); } catch { /* сохранится позже */ } }
         return;
     }
 
-    const chat = ctx?.chat || [];
+    const chat = C().chat || [];
     const batch = msgQueue.slice(0, MSG_BATCH);
     const blocks = batch.map((id) => ({ key: String(id), text: chat[id].mes }));
 
@@ -1094,7 +1106,7 @@ async function processMessageQueue() {
         msgTimer = setTimeout(async () => { msgTimer = null; await processMessageQueue(); }, MSG_TICK_MS);
     } else if (msgDirty) {
         msgDirty = false;
-        try { ctx.saveChat?.(); } catch { /* сохранится позже */ }
+        try { C().saveChat?.(); } catch { /* сохранится позже */ }
     }
 }
 
