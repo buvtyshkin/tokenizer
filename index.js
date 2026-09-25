@@ -157,12 +157,74 @@ function computeCost(u) {
 // ---------- разбор стрима ----------
 
 function newUsage(meta) {
-    return { model: meta.model || null, in: 0, out: 0, cr: 0, cw: 0, cw5: null, cw1: null, think: 0, seen: false };
+    return { model: meta.model || null, in: 0, out: 0, cr: 0, cw: 0, cw5: null, cw1: null, think: 0, seen: false, refusal: null };
+}
+
+// ---------- отказы моделей ----------
+// Anthropic отвечает на срабатывание классификатора HTTP 200 со stop_reason
+// "refusal" и пустым текстом, Google — блокировкой по безопасности. Таверна ни
+// то, ни другое не показывает: в чате просто появляется пустое сообщение.
+
+const GOOGLE_BLOCK_REASONS = new Set(['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'RECITATION', 'IMAGE_SAFETY']);
+
+const REFUSAL_HINTS = {
+    reasoning_extraction: 'классификатор принял запрос за попытку вытащить рассуждения модели. Частая причина — инструкции пресета, которые просят выводить в ответ «сырые» мысли или ход размышлений',
+    SAFETY: 'сработал фильтр безопасности Google',
+    PROHIBITED_CONTENT: 'контент запрещён правилами Google',
+    BLOCKLIST: 'в тексте есть термины из списка блокировки Google',
+    SPII: 'ответ содержал бы чувствительные персональные данные',
+    RECITATION: 'ответ дословно воспроизводил бы чужой текст',
+    IMAGE_SAFETY: 'сработал фильтр безопасности изображений Google',
+};
+
+function detectRefusal(u, obj) {
+    // Anthropic: в стриме причина лежит в delta события message_delta,
+    // без стрима — на верхнем уровне ответа.
+    const src = obj.type === 'message_delta' ? (obj.delta || {}) : obj;
+    if (src.stop_reason === 'refusal') {
+        const d = src.stop_details || obj.stop_details || {};
+        u.refusal = { provider: 'anthropic', category: d.category || null, explanation: String(d.explanation || '') };
+        return;
+    }
+    // Google: заблокирован сам запрос…
+    const blocked = obj.promptFeedback?.blockReason;
+    if (blocked) {
+        u.refusal = { provider: 'google', category: String(blocked), explanation: String(obj.promptFeedback.blockReasonMessage || '') };
+        return;
+    }
+    // …или остановлена генерация ответа.
+    const finish = obj.candidates?.[0]?.finishReason;
+    if (finish && GOOGLE_BLOCK_REASONS.has(finish)) {
+        u.refusal = { provider: 'google', category: String(finish), explanation: String(obj.candidates[0].finishMessage || '') };
+    }
+}
+
+function refusalSummary(r) {
+    const who = r.provider === 'google' ? 'Google' : 'Anthropic';
+    const hint = REFUSAL_HINTS[r.category];
+    return `${who} отклонил запрос${r.category ? ' (' + r.category + ')' : ''}${hint ? ': ' + hint : ''}.`;
+}
+
+function refusalTitle(r) {
+    const billing = r.unbilled ? '\nНе тарифицируется: отказ случился до начала ответа.' : '';
+    return `${refusalSummary(r)}${billing}${r.explanation ? '\n\n' + r.explanation : ''}`;
+}
+
+function notifyRefusal(r, model, unbilled) {
+    const text = [
+        refusalSummary(r),
+        'Пустой ответ — это отказ модели, а не сбой Таверны.',
+        unbilled ? 'Не тарифицируется: отказ случился до начала ответа.' : '',
+        `Модель: ${model}.`,
+    ].filter(Boolean).join(' ');
+    toastr.warning(text, 'Fisher Cost · отказ модели', { timeOut: 20000, extendedTimeOut: 10000 });
+    console.warn(`${LOG} отказ модели`, r);
 }
 
 /** Один чанк стрима или целый JSON-ответ → поля usage. Общий для стрима и non-stream. */
 function applyUsage(u, obj) {
     if (!obj || typeof obj !== 'object') return;
+    detectRefusal(u, obj);
     // Anthropic
     if (obj.type === 'message_start' && obj.message) {
         const mu = obj.message.usage || {};
@@ -196,6 +258,25 @@ function applyUsage(u, obj) {
         const cand = g.candidatesTokenCount ?? null;
         const think = g.thoughtsTokenCount ?? 0;
         if (cand != null) { u.out = cand + think; u.think = think; }   // thinking у Google оплачивается как выход
+        // Оборванный стрим Vertex присылает usageMetadata вообще без чисел. Пустая запись
+        // хуже отсутствующей: она оседает в журнале нулём, наследуется следующими свайпами
+        // и выдаёт чужую стоимость за свою.
+        if (g.promptTokenCount != null || cand != null) u.seen = true;
+        return;
+    }
+
+    // Anthropic без стриминга: usage лежит целиком в теле ответа, а не в дельтах.
+    if (obj.usage && (obj.usage.input_tokens != null || obj.usage.output_tokens != null)) {
+        const mu = obj.usage;
+        if (obj.model) u.model = obj.model;
+        u.in = mu.input_tokens ?? u.in;
+        u.out = mu.output_tokens ?? u.out;
+        u.cr = mu.cache_read_input_tokens ?? u.cr;
+        u.cw = mu.cache_creation_input_tokens ?? u.cw;
+        if (mu.cache_creation) {
+            u.cw5 = mu.cache_creation.ephemeral_5m_input_tokens ?? 0;
+            u.cw1 = mu.cache_creation.ephemeral_1h_input_tokens ?? 0;
+        }
         u.seen = true;
         return;
     }
@@ -241,7 +322,7 @@ async function consumeStream(stream, meta) {
     } catch (e) {
         console.debug(`${LOG} стрим прерван`, e);
     }
-    return u.seen ? u : null;
+    return (u.seen || u.refusal) ? u : null;
 }
 
 function installFetchHook() {
@@ -303,7 +384,7 @@ async function handleNonStream(cloned, meta) {
         // Google non-stream без обёртки (на всякий случай) — usageMetadata на верхнем уровне
         if (!u.seen && json.usageMetadata) applyUsage(u, { usageMetadata: json.usageMetadata, modelVersion: json.modelVersion });
     }
-    if (u.seen) {
+    if (u.seen || u.refusal) {
         if (isRefreshPing(meta)) recordRefresh(u, meta, false);
         else onUsage(u, meta);
         return;
@@ -356,7 +437,7 @@ function warnNonStream() {
     const now = Date.now();
     if (now - lastNonStreamWarn < 60_000) return;
     lastNonStreamWarn = now;
-    toastr.info('Fisher Cost: запрос без стриминга — сервер Таверны выбрасывает usage, стоимость не посчитана.', '', { timeOut: 8000 });
+    toastr.info('Fisher Cost: ответ без стриминга пришёл без usage — стоимость не посчитана. Для Claude и Google нужен патч сервера Таверны, см. README.', '', { timeOut: 8000 });
 }
 
 /** Custom-источник (Moonshot, NanoGPT и т.п.): просим usage в последнем чанке стрима. */
@@ -378,7 +459,13 @@ function onSettingsReady(generate_data) {
 // ---------- привязка usage к сообщению / журналу ----------
 
 function onUsage(u, meta) {
-    const { cost, priced, long, offpeak } = computeCost(u);
+    const computed = computeCost(u);
+    const { priced, long, offpeak } = computed;
+    // Anthropic не тарифицирует отказ, случившийся до начала вывода, — ни вход,
+    // ни выход, хотя usage вход сообщает. Отказ посреди ответа оплачивается как
+    // обычно, по уже выданному тексту.
+    const unbilledRefusal = !!(u.refusal && u.refusal.provider === 'anthropic' && !u.out);
+    const cost = unbilledRefusal ? 0 : computed.cost;
     const rec = {
         t: Date.now(),
         model: u.model || meta.model || '?',
@@ -393,9 +480,11 @@ function onUsage(u, meta) {
         offpeak: !!offpeak,
         cost,
         priced,
+        ...(u.refusal ? { refusal: { ...u.refusal, unbilled: unbilledRefusal } } : {}),
     };
 
     lastPromptByChat[chatLabel()] = { model: rec.model, in: rec.in, cr: rec.cr, cw: rec.cw };
+    if (u.refusal) notifyRefusal(u.refusal, rec.model, unbilledRefusal);
 
     if (awaitingMessageId != null) {
         const id = awaitingMessageId;
@@ -426,8 +515,28 @@ function onMessageReceived(messageId) {
     } else {
         awaitingMessageId = id;
         // страховка: если стрим так и не отдал usage
-        setTimeout(() => { if (awaitingMessageId === id) awaitingMessageId = null; }, ATTACH_WAIT_MS);
+        setTimeout(() => {
+            if (awaitingMessageId !== id) return;
+            awaitingMessageId = null;
+            dropStaleRecord(id);
+        }, ATTACH_WAIT_MS);
     }
+}
+
+/**
+ * Новый свайп наследует extra предыдущего вместе с нашей записью. Если usage к этому
+ * ответу так и не пришёл, унаследованная цифра показывает чужую стоимость как свою.
+ * Честнее убрать её, чем оставить правдоподобную ложь.
+ */
+function dropStaleRecord(id) {
+    const chat = SillyTavern.getContext().chat;
+    const mes = chat?.[id];
+    if (!mes?.extra?.[EXTRA_KEY]) return;
+    delete mes.extra[EXTRA_KEY];
+    if (Array.isArray(mes.swipe_info) && mes.swipe_id != null && mes.swipe_info[mes.swipe_id]?.extra) {
+        delete mes.swipe_info[mes.swipe_id].extra[EXTRA_KEY];
+    }
+    renderMessageLine(id);
 }
 
 function attachToMessage(id, rec) {
@@ -517,6 +626,9 @@ function messageLineHtml(u, tok) {
             + '</span>';
     }
     const cacheTotal = u.cr + u.cw + u.in;
+    const ref = u.refusal
+        ? `<span class="fc-refusal" title="${escapeHtml(refusalTitle(u.refusal))}">⛔ отказ${u.refusal.category ? ': ' + escapeHtml(u.refusal.category) : ''}</span>`
+        : '';
     const hit = cacheTotal > 0 ? Math.round((u.cr / cacheTotal) * 100) : 0;
     const hitCls = hit >= 85 ? 'fc-hit-good' : hit >= 50 ? 'fc-hit-mid' : 'fc-hit-bad';
     const costTxt = u.priced ? fmtUsd(u.cost) : '<span class="fc-unpriced" title="Модели нет в таблице цен">цена?</span>';
@@ -530,6 +642,7 @@ function messageLineHtml(u, tok) {
     const title = `${u.model}\nвход ${fmtInt(u.in)}\nвыход ${fmtInt(u.out)}\nкэш-чтение ${fmtInt(u.cr)}\nкэш-запись ${fmtInt(u.cw)}${ttl ? ' (' + ttl + ')' : ''}\nкэш-хит ${hit}%${extra}`;
 
     const full = `<span class="fc-full">`
+        + ref
         + `<span class="fc-model">${escapeHtml(u.model)}</span>`
         + ` <span>вход ${fmtInt(u.in)}</span>`
         + ` <span>выход ${fmtInt(u.out)}</span>`
@@ -541,6 +654,7 @@ function messageLineHtml(u, tok) {
 
     // компакт: без модели, сокращённые числа, переносится, если всё равно не влезает
     const compact = `<span class="fc-compact">`
+        + ref
         + `<span>in ${fmtShort(u.in)}</span>`
         + ` <span>out ${fmtShort(u.out)}</span>`
         + ` <span>CR ${fmtShort(u.cr)}</span>`
