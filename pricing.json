@@ -90,6 +90,13 @@
         "cache_write_5m": 18.75,
         "cache_write_1h": 30
     },
+    "claude-sonnet-5-5": {
+        "input": 2,
+        "output": 10,
+        "cache_read": 0.2,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4
+    },
     "claude-sonnet-5": {
         "input": 2,
         "output": 10,
