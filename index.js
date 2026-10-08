@@ -138,7 +138,7 @@ function computeCost(u) {
     if (cw5 == null && cw1 == null) {
         if (settings.defaultTtl === '1h') { cw1 = u.cw; cw5 = 0; } else { cw5 = u.cw; cw1 = 0; }
     }
-    // длинный контекст (Gemini Pro, OpenAI, xAI): весь запрос по повышенному тарифу
+    // длинный контекст (Gemini Pro, OpenAI, xAI, Claude Haiku 5.5): весь запрос по повышенному тарифу
     const promptTotal = (u.in || 0) + (u.cr || 0) + (u.cw || 0);
     const long = p.long_threshold && promptTotal > p.long_threshold;
     const rIn = long ? (p.input_long ?? p.input) : p.input;
@@ -149,8 +149,8 @@ function computeCost(u) {
         (u.in || 0) * (rIn || 0) +
         (u.out || 0) * (rOut || 0) +
         (u.cr || 0) * (rCr || 0) +
-        (cw5 || 0) * (p.cache_write_5m ?? p.cache_write ?? 0) +
-        (cw1 || 0) * (p.cache_write_1h ?? p.cache_write ?? 0);
+        (cw5 || 0) * ((long ? p.cache_write_5m_long : null) ?? p.cache_write_5m ?? p.cache_write ?? 0) +
+        (cw1 || 0) * ((long ? p.cache_write_1h_long : null) ?? p.cache_write_1h ?? p.cache_write ?? 0);
     return { cost: (cost * factor) / 1e6, priced: true, long: !!long, offpeak: factor !== 1 };
 }
 
@@ -336,6 +336,8 @@ function installFetchHook() {
         try {
             const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
             if (body) meta = { model: body.model || null, stream: !!body.stream, source: body.chat_completion_source || null, maxTokens: body.max_tokens ?? null };
+            // Story Toolkit's Little Helper raises this flag for the duration of its request.
+            meta.helper = !!window.__stkHelperBusy;
         } catch { /* тело не наше дело */ }
 
         const response = await original.apply(this, arguments);
@@ -486,6 +488,12 @@ function onUsage(u, meta) {
     lastPromptByChat[chatLabel()] = { model: rec.model, in: rec.in, cr: rec.cr, cw: rec.cw };
     if (u.refusal) notifyRefusal(u.refusal, rec.model, unbilledRefusal);
 
+    // Little Helper: варианты хода игрока, сообщения в чате не будет — пишем сразу.
+    if (meta.helper) {
+        recordLedger(rec, 'helper', currentGenType);
+        return;
+    }
+
     if (awaitingMessageId != null) {
         const id = awaitingMessageId;
         awaitingMessageId = null;
@@ -580,8 +588,10 @@ function recordLedger(rec, kind, genType) {
     const key = `${dayKey(rec.t)}|${chat}|${rec.model}`;
     const d = settings.daily[key] || (settings.daily[key] = { day: dayKey(rec.t), chat, model: rec.model, n: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svc: 0, svcCost: 0, ref: 0, refCost: 0, unpriced: 0 });
     d.ref = d.ref || 0; d.refCost = d.refCost || 0;   // записи, созданные до появления рефреш-счётчика
+    d.hlp = d.hlp || 0; d.hlpCost = d.hlpCost || 0;   // …и до появления Little Helper
     if (kind === 'message') d.n += 1;
     else if (kind === 'refresh') { d.ref += 1; d.refCost += rec.cost || 0; }
+    else if (kind === 'helper') { d.hlp += 1; d.hlpCost += rec.cost || 0; }
     else { d.svc += 1; d.svcCost += rec.cost || 0; }
     d.in += rec.in; d.out += rec.out; d.cr += rec.cr; d.cw += rec.cw;
     d.cost += rec.cost || 0;
@@ -693,11 +703,12 @@ function renderAllLines() {
 // ---------- отчёт ----------
 
 function sumRaw(since) {
-    const acc = { n: 0, svc: 0, ref: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, refCost: 0, unpriced: 0 };
+    const acc = { n: 0, svc: 0, ref: 0, hlp: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, refCost: 0, hlpCost: 0, unpriced: 0 };
     for (const e of settings.raw) {
         if (e.t < since) continue;
         if (e.kind === 'message') acc.n++;
         else if (e.kind === 'refresh') { acc.ref++; acc.refCost += e.cost || 0; }
+        else if (e.kind === 'helper') { acc.hlp++; acc.hlpCost += e.cost || 0; }
         else { acc.svc++; acc.svcCost += e.cost || 0; }
         acc.in += e.in; acc.out += e.out; acc.cr += e.cr; acc.cw += e.cw; acc.cost += e.cost || 0;
         if (!e.priced) acc.unpriced++;
@@ -707,18 +718,19 @@ function sumRaw(since) {
 
 function sumDaily(days) {
     const cutoff = dayKey(Date.now() - (days - 1) * 86400 * 1000);
-    const acc = { n: 0, svc: 0, ref: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, refCost: 0, unpriced: 0 };
+    const acc = { n: 0, svc: 0, ref: 0, hlp: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0, svcCost: 0, refCost: 0, hlpCost: 0, unpriced: 0 };
     const byChat = {};
     const byModel = {};
     for (const d of Object.values(settings.daily)) {
         if (d.day < cutoff) continue;
         const ref = d.ref || 0, refCost = d.refCost || 0;
-        acc.n += d.n; acc.svc += d.svc; acc.ref += ref; acc.in += d.in; acc.out += d.out; acc.cr += d.cr; acc.cw += d.cw;
-        acc.cost += d.cost; acc.svcCost += d.svcCost; acc.refCost += refCost; acc.unpriced += d.unpriced;
-        const c = byChat[d.chat] || (byChat[d.chat] = { n: 0, svc: 0, ref: 0, cost: 0, refCost: 0, in: 0, out: 0, cr: 0, cw: 0 });
-        c.n += d.n; c.svc += d.svc; c.ref += ref; c.cost += d.cost; c.refCost += refCost; c.in += d.in; c.out += d.out; c.cr += d.cr; c.cw += d.cw;
+        const hlp = d.hlp || 0, hlpCost = d.hlpCost || 0;
+        acc.n += d.n; acc.svc += d.svc; acc.ref += ref; acc.hlp += hlp; acc.in += d.in; acc.out += d.out; acc.cr += d.cr; acc.cw += d.cw;
+        acc.cost += d.cost; acc.svcCost += d.svcCost; acc.refCost += refCost; acc.hlpCost += hlpCost; acc.unpriced += d.unpriced;
+        const c = byChat[d.chat] || (byChat[d.chat] = { n: 0, svc: 0, ref: 0, hlp: 0, cost: 0, refCost: 0, hlpCost: 0, in: 0, out: 0, cr: 0, cw: 0 });
+        c.n += d.n; c.svc += d.svc; c.ref += ref; c.hlp += hlp; c.cost += d.cost; c.refCost += refCost; c.hlpCost += hlpCost; c.in += d.in; c.out += d.out; c.cr += d.cr; c.cw += d.cw;
         const m = byModel[d.model] || (byModel[d.model] = { n: 0, cost: 0 });
-        m.n += d.n + d.svc + ref; m.cost += d.cost;
+        m.n += d.n + d.svc + ref + hlp; m.cost += d.cost;
     }
     return { acc, byChat, byModel };
 }
@@ -735,13 +747,24 @@ function sumCurrentChat() {
     return acc;
 }
 
+/** Little Helper в текущем чате — по дневным агрегатам журнала (120 дней). */
+function sumHelperForChat(label) {
+    const acc = { n: 0, cost: 0 };
+    for (const d of Object.values(settings.daily)) {
+        if (d.chat !== label) continue;
+        acc.n += d.hlp || 0;
+        acc.cost += d.hlpCost || 0;
+    }
+    return acc;
+}
+
 function periodRow(label, a, note) {
     const hitBase = a.cr + a.cw + a.in;
     const hit = hitBase ? Math.round((a.cr / hitBase) * 100) : 0;
     return `<tr>
         <td class="fc-lbl">${label}</td>
         <td class="fc-num"><b>${fmtUsd(a.cost)}</b>${a.unpriced ? ` <span class="fc-unpriced" title="${a.unpriced} ответов без цены">*</span>` : ''}</td>
-        <td class="fc-num">${fmtInt(a.n)}${a.svc ? ` <span class="fc-dim">+${fmtInt(a.svc)} служ. (${fmtUsd(a.svcCost)})</span>` : ''}${a.ref ? ` <span class="fc-dim" title="пинги кэш-рефрешера; для Claude и Google стоимость оценочная — сервер Таверны не отдаёт usage без стриминга">+${fmtInt(a.ref)} рефреш (≈${fmtUsd(a.refCost)})</span>` : ''}</td>
+        <td class="fc-num">${fmtInt(a.n)}${a.svc ? ` <span class="fc-dim">+${fmtInt(a.svc)} служ. (${fmtUsd(a.svcCost)})</span>` : ''}${a.hlp ? ` <span class="fc-dim" title="Little Helper — варианты вашего хода">+${fmtInt(a.hlp)} 🪄 (${fmtUsd(a.hlpCost)})</span>` : ''}${a.ref ? ` <span class="fc-dim" title="пинги кэш-рефрешера; для Claude и Google стоимость оценочная — сервер Таверны не отдаёт usage без стриминга">+${fmtInt(a.ref)} рефреш (≈${fmtUsd(a.refCost)})</span>` : ''}</td>
         <td class="fc-num">${fmtInt(a.in)}</td>
         <td class="fc-num">${fmtInt(a.out)}</td>
         <td class="fc-num">${fmtInt(a.cr)}</td>
@@ -767,7 +790,7 @@ function buildReportHtml(days) {
         ? chats.map(([name, c]) => `<tr>
             <td class="fc-lbl">${escapeHtml(name)}</td>
             <td class="fc-num"><b>${fmtUsd(c.cost)}</b></td>
-            <td class="fc-num">${fmtInt(c.n)}${c.svc ? ` <span class="fc-dim">+${c.svc}</span>` : ''}${c.ref ? ` <span class="fc-dim" title="пинги кэш-рефрешера, ≈${fmtUsd(c.refCost)}">+${c.ref}↻</span>` : ''}</td>
+            <td class="fc-num">${fmtInt(c.n)}${c.svc ? ` <span class="fc-dim">+${c.svc}</span>` : ''}${c.hlp ? ` <span class="fc-dim" title="Little Helper, ${fmtUsd(c.hlpCost)}">+${c.hlp}🪄</span>` : ''}${c.ref ? ` <span class="fc-dim" title="пинги кэш-рефрешера, ≈${fmtUsd(c.refCost)}">+${c.ref}↻</span>` : ''}</td>
             <td class="fc-num">${c.n ? fmtUsd(c.cost / c.n) : '—'}</td>
             <td class="fc-num">${fmtInt(c.in)}</td>
             <td class="fc-num">${fmtInt(c.out)}</td>
@@ -777,6 +800,19 @@ function buildReportHtml(days) {
         : '<tr><td colspan="8" class="fc-dim">За этот период записей нет. Отправь сообщение — появится первая.</td></tr>';
 
     const modelRows = models.map(([name, m]) => `<tr><td class="fc-lbl">${escapeHtml(name)}</td><td class="fc-num"><b>${fmtUsd(m.cost)}</b></td><td class="fc-num">${fmtInt(m.n)}</td></tr>`).join('');
+
+    const hlpChat = sumHelperForChat(chatLabel());
+    const hlpRow = (label, n, cost) => `<tr><td class="fc-lbl">${label}</td><td class="fc-num"><b>${fmtUsd(cost)}</b></td><td class="fc-num">${fmtInt(n)}</td></tr>`;
+    const helperSection = (month.acc.hlp || hlpChat.n) ? `<h3>🪄 Little Helper <span class="fc-dim">варианты вашего хода — уже входят в суммы выше</span></h3>
+        <table class="fc-table fc-narrow">
+            <thead><tr><th></th><th>стоимость</th><th>запросов</th></tr></thead>
+            <tbody>
+                ${hlpRow('Сегодня', today.hlp, today.hlpCost)}
+                ${hlpRow('7 дней', week.acc.hlp, week.acc.hlpCost)}
+                ${hlpRow('30 дней', month.acc.hlp, month.acc.hlpCost)}
+                ${hlpRow('Этот чат', hlpChat.n, hlpChat.cost)}
+            </tbody>
+        </table>` : '';
 
     const curHitBase = cur.cr + cur.cw + cur.in;
     const curHit = curHitBase ? Math.round((cur.cr / curHitBase) * 100) : 0;
@@ -793,6 +829,8 @@ function buildReportHtml(days) {
                 ${periodRow('Эта вкладка', session, 'с ' + new Date(sessionStart).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }))}
             </tbody>
         </table>
+
+        ${helperSection}
 
         <h3>Этот чат <span class="fc-dim">${escapeHtml(chatLabel())}</span></h3>
         <p class="fc-cur">
@@ -868,9 +906,9 @@ function updateChip() {
 }
 
 function exportCsv() {
-    const rows = [['day', 'chat', 'model', 'messages', 'service', 'refresh', 'input', 'output', 'cache_read', 'cache_write', 'cost_usd', 'service_cost_usd', 'refresh_cost_usd', 'unpriced']];
+    const rows = [['day', 'chat', 'model', 'messages', 'service', 'refresh', 'input', 'output', 'cache_read', 'cache_write', 'cost_usd', 'service_cost_usd', 'refresh_cost_usd', 'unpriced', 'helper', 'helper_cost_usd']];
     for (const d of Object.values(settings.daily).sort((a, b) => a.day.localeCompare(b.day))) {
-        rows.push([d.day, d.chat, d.model, d.n, d.svc, d.ref || 0, d.in, d.out, d.cr, d.cw, d.cost.toFixed(6), d.svcCost.toFixed(6), (d.refCost || 0).toFixed(6), d.unpriced]);
+        rows.push([d.day, d.chat, d.model, d.n, d.svc, d.ref || 0, d.in, d.out, d.cr, d.cw, d.cost.toFixed(6), d.svcCost.toFixed(6), (d.refCost || 0).toFixed(6), d.unpriced, d.hlp || 0, (d.hlpCost || 0).toFixed(6)]);
     }
     const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });

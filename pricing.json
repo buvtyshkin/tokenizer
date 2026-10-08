@@ -1,7 +1,7 @@
 {
-    "_comment": "Доллары за миллион токенов, по официальной таблице platform.claude.com/docs/en/about-claude/pricing (сверено 07.09.2026). Ключ — префикс id модели, берётся самый длинный совпавший. cache_write_5m = 1.25x входа, cache_write_1h = 2x входа, cache_read = 0.1x (Fable/Mythos 5.1 — 0.025x).",
+    "_comment": "Доллары за миллион токенов, по официальной таблице platform.claude.com/docs/en/about-claude/pricing (сверено 07.09.2026). Ключ — префикс id модели, берётся самый длинный совпавший. cache_write_5m = 1.25x входа, cache_write_1h = 2x входа, cache_read = 0.1x (Fable/Mythos 5.1 — 0.025x; Opus 5.5 и Sonnet 5.5 — 0.05x). Haiku 5.5 — два тарифа: промпт до 100k и свыше (сверено 08.10.2026).",
     "_comment_moonshot": "Moonshot (api.moonshot.ai, Custom-источник): кэш неявный и бесплатный на запись, cache_read — цена cache-hit. Проверено 08.09.2026: kimi-k3 3/15/0.30; k2.7-code 0.95/4/0.19; k2.6 0.95/4 (cache-hit официально не опубликован, взят как у k2.7).",
-    "_comment_fields": "Поля: input/output/cache_read — $/M; cache_write_5m, cache_write_1h — запись в кэш (Anthropic, OpenAI); long_threshold + input_long/output_long/cache_read_long — тариф длинного контекста, если весь промпт (вход+кэш) больше порога; peak_hours_utc/peak_weekdays_only/offpeak_factor — пиковые часы (DeepSeek).",
+    "_comment_fields": "Поля: input/output/cache_read — $/M; cache_write_5m, cache_write_1h — запись в кэш (Anthropic, OpenAI); long_threshold + input_long/output_long/cache_read_long/cache_write_5m_long/cache_write_1h_long — тариф длинного контекста, если весь промпт (вход+кэш) больше порога; peak_hours_utc/peak_weekdays_only/offpeak_factor — пиковые часы (DeepSeek).",
     "_comment_google": "Google AI Studio (источник Google/MakerSuite): сверено с ai.google.dev/gemini-api/docs/pricing 16.09.2026. Кэш неявный, бесплатный на запись. ВНИМАНИЕ: Gemini 3.6/3.7/3.8 Flash — вводные цены до 31.12.2026, с 1 января 2027 удваиваются (1.50/7.50/0.15). Thinking-токены считаются как выход.",
     "_comment_openai": "OpenAI (сверено 16.09.2026): Sol — промо $4/$20 минимум до 21.11.2026; кэш-запись 1.25x входа у 5.6+; длинный контекст >272k. Через родной источник OpenAI в Таверне usage в стриме НЕ приходит — подключай через Custom с URL https://api.openai.com/v1.",
     "_comment_xai": "xAI (сверено 16.09.2026): длинный контекст — от 200k весь запрос вдвое дороже.",
@@ -93,7 +93,7 @@
     "claude-sonnet-5-5": {
         "input": 2,
         "output": 10,
-        "cache_read": 0.2,
+        "cache_read": 0.1,
         "cache_write_5m": 2.5,
         "cache_write_1h": 4
     },
@@ -124,6 +124,19 @@
         "cache_read": 0.3,
         "cache_write_5m": 3.75,
         "cache_write_1h": 6
+    },
+    "claude-haiku-5-5": {
+        "input": 0.1,
+        "output": 0.5,
+        "cache_read": 0.01,
+        "cache_write_5m": 0.125,
+        "cache_write_1h": 0.2,
+        "long_threshold": 100000,
+        "input_long": 0.5,
+        "output_long": 2.5,
+        "cache_read_long": 0.05,
+        "cache_write_5m_long": 0.625,
+        "cache_write_1h_long": 1
     },
     "claude-haiku-4-5": {
         "input": 1,
