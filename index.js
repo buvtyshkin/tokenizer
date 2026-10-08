@@ -336,8 +336,8 @@ function installFetchHook() {
         try {
             const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
             if (body) meta = { model: body.model || null, stream: !!body.stream, source: body.chat_completion_source || null, maxTokens: body.max_tokens ?? null };
-            // Story Toolkit's Little Helper raises this flag for the duration of its request.
-            meta.helper = !!window.__stkHelperBusy;
+            // Story Toolkit's Little Helper sets a per-request tag for the duration of its request.
+            meta.helper = window.__stkHelperBusy || null;
         } catch { /* тело не наше дело */ }
 
         const response = await original.apply(this, arguments);
@@ -491,6 +491,8 @@ function onUsage(u, meta) {
     // Little Helper: варианты хода игрока, сообщения в чате не будет — пишем сразу.
     if (meta.helper) {
         recordLedger(rec, 'helper', currentGenType);
+        // Little Helper shows this record under the matching generation.
+        window.dispatchEvent(new CustomEvent('fisher-cost:usage', { detail: { tag: meta.helper, rec } }));
         return;
     }
 
@@ -1270,6 +1272,8 @@ async function processMessageQueue() {
 }
 
 function init() {
+    // Other extensions (Little Helper) draw the same usage line as under messages.
+    window.fisherCost = { lineHtml: (u) => messageLineHtml(u, null) };
     try {
         ctx = SillyTavern.getContext();
     } catch (e) {
