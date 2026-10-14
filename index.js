@@ -102,6 +102,25 @@ async function loadPricing() {
     for (const k of Object.keys(pricing)) if (k.startsWith('_')) delete pricing[k];
 }
 
+/**
+ * A price entry may carry scheduled changes, e.g. an introductory price that ends:
+ * "changes": [{ "from": "2026-12-01", "input": 4, "output": 20 }]. Every change whose
+ * date has come is layered over the base rates, in order. Cost is fixed at generation
+ * time, so a past message keeps the price it was made at.
+ */
+function withScheduledChanges(p) {
+    if (!p || !Array.isArray(p.changes)) return p;
+    const today = dayKey(Date.now());
+    let out = { ...p };
+    for (const c of p.changes) {
+        if (c && c.from && c.from <= today) {
+            const { from, ...rates } = c;
+            out = { ...out, ...rates };
+        }
+    }
+    return out;
+}
+
 function findPrice(model) {
     if (!model) return null;
     const m = String(model).toLowerCase();
@@ -118,7 +137,7 @@ function findPrice(model) {
         if (!best || k.length > best.length) best = k;
     }
     if (!best) return null;
-    return pricing[Object.keys(pricing).find((k) => k.toLowerCase() === best)];
+    return withScheduledChanges(pricing[Object.keys(pricing).find((k) => k.toLowerCase() === best)]);
 }
 
 /** Пиковые часы провайдера (DeepSeek): peak_hours_utc: [[1,4],[6,10]], offpeak_factor: 0.5 */
