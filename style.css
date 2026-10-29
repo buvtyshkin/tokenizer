@@ -115,3 +115,15 @@
 
 /* Отказ модели — пустое сообщение с объяснением в подсказке */
 .fc-refusal { color: #ef8b8b; font-weight: 600; cursor: help; }
+
+/* Остатки на счетах */
+.fc-bal-group {
+    margin: 8px 0 10px 0;
+    padding-left: 8px;
+    border-left: 2px solid var(--SmartThemeBorderColor, #555);
+}
+.fc-bal-group > b { display: block; margin-bottom: 4px; }
+.fc-num-input { width: 9em !important; }
+.fc-tb-bal .fc-tb-v { font-variant-numeric: tabular-nums; }
+.fc-tb-low .fc-tb-v { color: #ef8b8b; }
+.fc-tb-stale { opacity: 0.55; }

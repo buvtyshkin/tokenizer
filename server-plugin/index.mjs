@@ -10,6 +10,12 @@
  * POST /api/plugins/fisher-tokens/count
  *   { model: "claude-opus-5-5", blocks: [{ key: "chat", text: "..." }, ...] }
  * ->{ counts: { chat: 41230, ... }, cached: 3, errors: { persona: "..." } }
+ *
+ * It also reads the NanoGPT account balance, for the same reason: the key stays
+ * on the server and the browser only ever sees the numbers.
+ *
+ * POST /api/plugins/fisher-tokens/balance/nanogpt
+ * ->{ usd: 14.31, spendable: 14.31, pending: 0, pendingStatus: "...", at: 1761734400000 }
  */
 import crypto from 'node:crypto';
 import { readSecret, SECRET_KEYS } from '../../src/endpoints/secrets.js';
@@ -17,7 +23,7 @@ import { readSecret, SECRET_KEYS } from '../../src/endpoints/secrets.js';
 export const info = {
     id: 'fisher-tokens',
     name: 'Fisher Tokens',
-    description: 'Exact prompt-section token counts via Anthropic count_tokens.',
+    description: 'Exact prompt-section token counts via Anthropic count_tokens, and the NanoGPT balance.',
 };
 
 const ENDPOINT = 'https://api.anthropic.com/v1/messages/count_tokens';
@@ -47,6 +53,40 @@ function cacheGet(key) {
 function cacheSet(key, value) {
     cache.set(key, value);
     while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+}
+
+const NANOGPT_BALANCE_URL = 'https://nano-gpt.com/api/check-balance';
+/** Every open tab polls on its own; one upstream call a minute is plenty. */
+const BALANCE_TTL_MS = 60_000;
+let nanoBalanceCache = null;   // { at, body }
+
+/** NanoGPT returns money as decimal strings and null for fields it does not know. */
+function money(value) {
+    if (value == null || value === '') return null;   // Number(null) is 0, not "unknown"
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+async function fetchNanoBalance(apiKey) {
+    const response = await fetch(NANOGPT_BALANCE_URL, {
+        method: 'POST',   // GET answers 405
+        headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`check-balance ${response.status}: ${body.slice(0, 300)}`);
+    }
+    const data = await response.json();
+    const usd = money(data?.usd_balance);
+    if (usd === null) throw new Error('check-balance returned no usd_balance');
+    return {
+        usd,
+        spendable: money(data?.usd_spendable_balance),
+        pending: money(data?.usd_pending_usage),
+        pendingStatus: typeof data?.usd_pending_usage_status === 'string' ? data.usd_pending_usage_status : null,
+        at: Date.now(),
+    };
 }
 
 async function callCountTokens(apiKey, model, text) {
@@ -147,11 +187,31 @@ export async function init(router) {
         }
     });
 
-    console.log('[fisher-tokens] ready — POST /api/plugins/fisher-tokens/count');
+    router.post('/balance/nanogpt', async (request, response) => {
+        try {
+            const apiKey = readSecret(request.user.directories, SECRET_KEYS.NANOGPT);
+            if (!apiKey) {
+                return response.status(400).json({ error: 'no NanoGPT API key is stored in SillyTavern' });
+            }
+            const force = request.body?.force === true;
+            if (!force && nanoBalanceCache && Date.now() - nanoBalanceCache.at < BALANCE_TTL_MS) {
+                return response.json({ ...nanoBalanceCache.body, cached: true });
+            }
+            const body = await fetchNanoBalance(apiKey);
+            nanoBalanceCache = { at: body.at, body };
+            return response.json(body);
+        } catch (error) {
+            console.error('[fisher-tokens] nanogpt balance', error);
+            return response.status(502).json({ error: String(error.message || error).slice(0, 300) });
+        }
+    });
+
+    console.log('[fisher-tokens] ready — POST /api/plugins/fisher-tokens/count, /balance/nanogpt');
 }
 
 export async function exit() {
     cache.clear();
+    nanoBalanceCache = null;
     overheadByModel.clear();
 }
 

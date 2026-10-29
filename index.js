@@ -22,7 +22,20 @@ const DEFAULTS = {
     pricingOverride: '',       // JSON поверх pricing.json
     raw: [],                   // [{t, chat, model, kind, in, out, cr, cw5, cw1, cost, priced}]
     daily: {},                 // { 'YYYY-MM-DD|chat|model': {n, in, out, cr, cw, cost, svc, svcCost, priced} }
+    showBalances: true,        // остатки на счетах в строке над чатом
+    balances: {},              // см. BALANCE_DEFAULTS, нормализуется в B()
 };
+
+// Остатки на счетах. Anthropic не отдаёт баланс по API (а Admin API недоступен
+// личным аккаунтам), поэтому для Claude остаток — оценка от якоря: число из Console,
+// которое вписывается руками, минус всё, что расширение насчитало с того момента.
+// NanoGPT баланс отдаёт, его тянет серверный плагин — ключ в браузер не попадает.
+const BALANCE_DEFAULTS = {
+    claude: { amount: null, at: null, spent: 0, unpriced: 0, warnBelow: 10 },
+    nanogpt: { auto: true, every: 30, warnBelow: 5, last: null, error: null },
+};
+const NANO_BALANCE_URL = '/api/plugins/fisher-tokens/balance/nanogpt';
+const NANO_AFTER_GEN_MS = 20_000;          // после ответа NanoGPT списание доезжает не сразу
 
 let ctx = null;
 let settings = null;
@@ -34,6 +47,9 @@ let currentGenType = null;
 let sessionStart = Date.now();
 let lastNonStreamWarn = 0;
 let lastPromptByChat = {};        // { chatLabel: {model, in, cr, cw} } — размер последнего промпта, для оценки пингов
+let nanoTimer = null;             // периодический опрос баланса NanoGPT
+let nanoAfterGenTimer = null;     // опрос после ответа через NanoGPT
+let lowWarned = {};               // { claude: true } — о низком остатке уже предупредили
 
 // ---------- утилиты ----------
 
@@ -438,7 +454,7 @@ function estimateRefresh(meta) {
 
 function recordRefresh(u, meta, estimated) {
     const { cost, priced } = u.seen ? computeCost(u) : { cost: null, priced: false };
-    const rec = { t: Date.now(), model: u.model || meta.model || '?', in: u.in || 0, out: u.out || 0, cr: u.cr || 0, cw: u.cw || 0, cost, priced, est: !!estimated };
+    const rec = { t: Date.now(), model: u.model || meta.model || '?', in: u.in || 0, out: u.out || 0, cr: u.cr || 0, cw: u.cw || 0, cost, priced, est: !!estimated, src: meta.source || null };
     recordLedger(rec, 'refresh', 'refresh');
     console.log(`${LOG} пинг кэш-рефрешера${estimated ? ' (оценка)' : ''}`, rec);
 }
@@ -501,6 +517,7 @@ function onUsage(u, meta) {
         offpeak: !!offpeak,
         cost,
         priced,
+        src: meta.source || null,   // источник Таверны: claude, nanogpt… — по нему ведутся остатки
         ...(u.refusal ? { refusal: { ...u.refusal, unbilled: unbilledRefusal } } : {}),
     };
 
@@ -603,7 +620,7 @@ function attachToMessage(id, rec) {
 
 function recordLedger(rec, kind, genType) {
     const chat = chatLabel();
-    const entry = { t: rec.t, chat, model: rec.model, kind, gen: genType || null, in: rec.in, out: rec.out, cr: rec.cr, cw: rec.cw, cost: rec.cost, priced: rec.priced, est: !!rec.est };
+    const entry = { t: rec.t, chat, model: rec.model, kind, gen: genType || null, in: rec.in, out: rec.out, cr: rec.cr, cw: rec.cw, cost: rec.cost, priced: rec.priced, est: !!rec.est, src: rec.src || null };
     settings.raw.push(entry);
 
     const key = `${dayKey(rec.t)}|${chat}|${rec.model}`;
@@ -618,6 +635,7 @@ function recordLedger(rec, kind, genType) {
     d.cost += rec.cost || 0;
     if (!rec.priced) d.unpriced += 1;
 
+    trackBalanceSpend(rec);
     pruneLedger();
     settings.__dirty = true;
     ctx.saveSettingsDebounced();
@@ -631,6 +649,167 @@ function pruneLedger() {
     for (const k of Object.keys(settings.daily)) {
         if (settings.daily[k].day < cutoff) delete settings.daily[k];
     }
+}
+
+// ---------- остатки на счетах ----------
+
+/** Настройки остатков с недостающими полями: старые settings.json их не знают. */
+function B() {
+    const b = settings.balances || (settings.balances = {});
+    for (const [k, def] of Object.entries(BALANCE_DEFAULTS)) {
+        b[k] = { ...structuredClone(def), ...(b[k] || {}) };
+    }
+    return b;
+}
+
+function fmtBal(v) {
+    if (v == null || !Number.isFinite(v)) return '—';
+    return (v < 0 ? '−$' : '$') + Math.abs(v).toFixed(2);
+}
+
+function fmtWhen(t) {
+    if (!t) return '';
+    return new Date(t).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+/** Оценка остатка Claude: якорь минус насчитанное с момента якоря. null — якоря нет. */
+function claudeEstimate() {
+    const c = B().claude;
+    if (c.amount == null || !c.at) return null;
+    return c.amount - (c.spent || 0);
+}
+
+function setClaudeAnchor(amount) {
+    const c = B().claude;
+    c.amount = amount;
+    c.at = Date.now();
+    c.spent = 0;
+    c.unpriced = 0;
+    lowWarned.claude = false;
+    ctx.saveSettingsDebounced();
+    renderBalances();
+}
+
+/** Каждая запись журнала уменьшает оценку своего счёта. Запросы до якоря уже учтены в Console. */
+function trackBalanceSpend(rec) {
+    if (rec.src === 'claude') {
+        const c = B().claude;
+        if (c.at && rec.t >= c.at) {
+            if (rec.priced && rec.cost != null) c.spent = (c.spent || 0) + rec.cost;
+            else c.unpriced = (c.unpriced || 0) + 1;
+            checkLowBalance('claude', claudeEstimate(), c.warnBelow, '≈');
+            renderBalances();
+        }
+    } else if (rec.src === 'nanogpt') {
+        clearTimeout(nanoAfterGenTimer);
+        nanoAfterGenTimer = setTimeout(() => refreshNanoBalance(true), NANO_AFTER_GEN_MS);
+    }
+}
+
+/** Тост один раз на пересечение порога вниз; снова — только после подъёма выше порога. */
+function checkLowBalance(key, value, threshold, prefix = '') {
+    if (value == null || !Number.isFinite(threshold) || threshold <= 0) return;
+    const name = key === 'claude' ? 'Claude' : 'NanoGPT';
+    if (value < threshold) {
+        if (!lowWarned[key]) {
+            lowWarned[key] = true;
+            toastr.warning(`Fisher Cost: на счёте ${name} осталось ${prefix}${fmtBal(value)} — меньше порога ${fmtBal(threshold)}.`, '', { timeOut: 15000 });
+        }
+    } else {
+        lowWarned[key] = false;
+    }
+}
+
+async function refreshNanoBalance(force = false) {
+    const n = B().nanogpt;
+    try {
+        const r = await fetch(NANO_BALANCE_URL, {
+            method: 'POST',
+            headers: ctx.getRequestHeaders(),
+            body: JSON.stringify({ force }),
+        });
+        if (r.status === 404) throw new Error('нет маршрута в серверном плагине fisher-tokens — обновите его копию в plugins/ и перезапустите Таверну');
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+        n.last = { usd: data.usd, spendable: data.spendable, pending: data.pending, pendingStatus: data.pendingStatus, at: data.at };
+        n.error = null;
+        checkLowBalance('nanogpt', data.spendable ?? data.usd, n.warnBelow);
+    } catch (e) {
+        n.error = String(e.message || e);
+        console.warn(`${LOG} баланс NanoGPT`, e);
+    }
+    ctx.saveSettingsDebounced();
+    renderBalances();
+}
+
+function startNanoPolling() {
+    clearInterval(nanoTimer);
+    nanoTimer = null;
+    const n = B().nanogpt;
+    if (!n.auto) return;
+    refreshNanoBalance();
+    nanoTimer = setInterval(() => refreshNanoBalance(), Math.max(5, Number(n.every) || 30) * 60_000);
+}
+
+/** Ячейки остатков для строки над чатом. */
+function balanceCellsHtml(compact) {
+    if (!settings?.showBalances) return '';
+    const b = B();
+    const out = [];
+    const est = claudeEstimate();
+    if (est != null) {
+        const low = b.claude.warnBelow > 0 && est < b.claude.warnBelow ? ' fc-tb-low' : '';
+        const title = `оценка: ${fmtBal(b.claude.amount)} из Console на ${fmtWhen(b.claude.at)} минус ${fmtBal(b.claude.spent)}, насчитанные с тех пор`;
+        out.push(`<span class="fc-tb-cell fc-tb-bal${low}" title="${escapeHtml(title)}"><span class="fc-tb-l">${compact ? 'C' : 'Claude'}</span><span class="fc-tb-v">≈${fmtBal(est)}</span></span>`);
+    }
+    const nl = b.nanogpt.last;
+    if (b.nanogpt.auto && nl) {
+        const v = nl.spendable ?? nl.usd;
+        const low = b.nanogpt.warnBelow > 0 && v < b.nanogpt.warnBelow ? ' fc-tb-low' : '';
+        const stale = b.nanogpt.error ? ' fc-tb-stale' : '';
+        const title = `NanoGPT, обновлено ${fmtWhen(nl.at)}${b.nanogpt.error ? ' — последняя попытка не удалась: ' + b.nanogpt.error : ''}`;
+        out.push(`<span class="fc-tb-cell fc-tb-bal${low}${stale}" title="${escapeHtml(title)}"><span class="fc-tb-l">${compact ? 'N' : 'NanoGPT'}</span><span class="fc-tb-v">${fmtBal(v)}</span></span>`);
+    }
+    return out.join('');
+}
+
+function claudeStatusHtml() {
+    const c = B().claude;
+    const est = claudeEstimate();
+    if (est == null) return 'Впишите остаток из Console (Settings → Billing) и нажмите «Записать».';
+    return `≈ <b>${fmtBal(est)}</b> · якорь ${fmtBal(c.amount)} от ${fmtWhen(c.at)}, насчитано с тех пор ${fmtBal(c.spent)}`
+        + (c.unpriced ? ` · <span class="fc-unpriced">${c.unpriced} без цены — оценка завышена</span>` : '');
+}
+
+function nanoStatusHtml() {
+    const n = B().nanogpt;
+    if (!n.auto) return 'Не опрашивается.';
+    const l = n.last;
+    const err = n.error ? `<span class="fc-tb-err">${escapeHtml(n.error)}</span>` : '';
+    if (!l) return err || 'Запрашиваю…';
+    const extra = (l.pending ? ` · в обработке ${fmtBal(l.pending)}` : '')
+        + (l.spendable != null && l.spendable !== l.usd ? ` · доступно ${fmtBal(l.spendable)}` : '');
+    return `<b>${fmtBal(l.usd)}</b>${extra} · обновлено ${fmtWhen(l.at)}${err ? '<br>' + err : ''}`;
+}
+
+/** Раздел отчёта. */
+function balancesReportHtml() {
+    const b = B();
+    const hasClaude = claudeEstimate() != null;
+    const hasNano = b.nanogpt.auto && (b.nanogpt.last || b.nanogpt.error);
+    if (!hasClaude && !hasNano) return '';
+    return `<h3>Остатки на счетах</h3>
+        <p class="fc-cur">
+            ${hasClaude ? `Claude: ${claudeStatusHtml()}<br>` : ''}
+            ${hasNano ? `NanoGPT: ${nanoStatusHtml()}<br>` : ''}
+            <span class="fc-dim">Claude — оценка: Anthropic не отдаёт баланс по API. Она не видит трат вне Таверны и пополнений — после них впишите остаток заново. NanoGPT — настоящий баланс с их сервера.</span>
+        </p>`;
+}
+
+function renderBalances() {
+    $('#fc_bal_claude_status').html(claudeStatusHtml());
+    $('#fc_bal_nano_status').html(nanoStatusHtml());
+    if (settings?.showTopbar) renderTopbar();
 }
 
 // ---------- строка под сообщением ----------
@@ -839,6 +1018,7 @@ function buildReportHtml(days) {
     const curHit = curHitBase ? Math.round((cur.cr / curHitBase) * 100) : 0;
 
     return `<div class="fc-report">
+        ${balancesReportHtml()}
         <h3>Расходы</h3>
         <table class="fc-table">
             <thead><tr><th></th><th>стоимость</th><th>ответов</th><th>вход</th><th>выход</th><th>кэш ↓</th><th>кэш ↑</th><th>хит</th><th></th></tr></thead>
@@ -978,6 +1158,39 @@ function addSettingsPanel() {
                     <textarea id="fc_pricing" class="text_pole textarea_compact" rows="6" placeholder='{"claude-opus-5": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 10}}'></textarea>
                     <div class="fc-dim">Доллары за миллион. Применяется к новым ответам; уже посчитанные не меняются.</div>
                 </details>
+                <details class="fc-details" id="fc_bal_block">
+                    <summary>Остатки на счетах</summary>
+                    <div class="fc-bal-group">
+                        <b>Claude API</b>
+                        <div class="fc-row">
+                            <input type="number" id="fc_bal_claude_amount" class="text_pole fc-num-input" step="0.01" min="0" placeholder="остаток, $">
+                            <div class="menu_button" id="fc_bal_claude_set">Записать</div>
+                        </div>
+                        <div class="fc-dim" id="fc_bal_claude_status"></div>
+                        <label class="fc-row">Предупредить, когда меньше $
+                            <input type="number" id="fc_bal_claude_warn" class="text_pole fc-num-input" step="1" min="0">
+                        </label>
+                    </div>
+                    <div class="fc-bal-group">
+                        <b>NanoGPT</b>
+                        <label class="checkbox_label"><input type="checkbox" id="fc_bal_nano_auto"> Тянуть баланс автоматически</label>
+                        <div class="fc-row">
+                            <select id="fc_bal_nano_every" class="text_pole fc-select">
+                                <option value="15">каждые 15 минут</option>
+                                <option value="30">каждые 30 минут</option>
+                                <option value="60">каждый час</option>
+                                <option value="120">каждые 2 часа</option>
+                            </select>
+                            <div class="menu_button" id="fc_bal_nano_refresh">Обновить</div>
+                        </div>
+                        <div class="fc-dim" id="fc_bal_nano_status"></div>
+                        <label class="fc-row">Предупредить, когда меньше $
+                            <input type="number" id="fc_bal_nano_warn" class="text_pole fc-num-input" step="1" min="0">
+                        </label>
+                        <div class="fc-dim">Ещё и через 20 секунд после каждого ответа через NanoGPT. Нужен серверный плагин <code>fisher-tokens</code>.</div>
+                    </div>
+                    <label class="checkbox_label"><input type="checkbox" id="fc_bal_topbar"> Показывать остатки в строке над чатом</label>
+                </details>
                 <div id="fc_inline_report"></div>
             </div>
         </div>
@@ -1019,6 +1232,49 @@ function addSettingsPanel() {
         await loadPricing();
     });
     $('#fc_open_report').on('click', openReport);
+
+    const bal = B();
+    $('#fc_bal_claude_set').on('click', () => {
+        const v = Number(String($('#fc_bal_claude_amount').val()).replace(',', '.'));
+        if (!Number.isFinite(v) || v < 0 || $('#fc_bal_claude_amount').val() === '') {
+            toastr.warning('Fisher Cost: впишите остаток числом, например 42.50');
+            return;
+        }
+        setClaudeAnchor(v);
+        $('#fc_bal_claude_amount').val('');
+        toastr.success(`Fisher Cost: остаток Claude ${fmtBal(v)} записан`);
+    });
+    $('#fc_bal_claude_amount').on('keydown', (e) => { if (e.key === 'Enter') $('#fc_bal_claude_set').trigger('click'); });
+    $('#fc_bal_claude_warn').val(bal.claude.warnBelow).on('change', function () {
+        B().claude.warnBelow = Math.max(0, Number(this.value) || 0);
+        lowWarned.claude = false;
+        ctx.saveSettingsDebounced();
+        renderBalances();
+    });
+    $('#fc_bal_nano_auto').prop('checked', bal.nanogpt.auto).on('change', function () {
+        B().nanogpt.auto = this.checked;
+        ctx.saveSettingsDebounced();
+        startNanoPolling();
+        renderBalances();
+    });
+    $('#fc_bal_nano_every').val(String(bal.nanogpt.every)).on('change', function () {
+        B().nanogpt.every = Number(this.value) || 30;
+        ctx.saveSettingsDebounced();
+        startNanoPolling();
+    });
+    $('#fc_bal_nano_refresh').on('click', () => refreshNanoBalance(true));
+    $('#fc_bal_nano_warn').val(bal.nanogpt.warnBelow).on('change', function () {
+        B().nanogpt.warnBelow = Math.max(0, Number(this.value) || 0);
+        lowWarned.nanogpt = false;
+        ctx.saveSettingsDebounced();
+        renderBalances();
+    });
+    $('#fc_bal_topbar').prop('checked', settings.showBalances).on('change', function () {
+        settings.showBalances = this.checked;
+        ctx.saveSettingsDebounced();
+        renderTopbar();
+    });
+    renderBalances();
 
     // пункт в меню «волшебной палочки» рядом с полем ввода
     const $menu = $('#extensionsMenu');
@@ -1176,10 +1432,13 @@ async function refreshBreakdown() {
 }
 
 function topbarHtml() {
+    // Остатки показываются, даже пока счётчик токенов думает или недоступен.
+    const bal = '<span class="fc-tb-full">' + balanceCellsHtml(false) + '</span>'
+        + '<span class="fc-tb-compact">' + balanceCellsHtml(true) + '</span>';
     if (!breakdown && breakdownErr) {
-        return `<span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">счётчик недоступен</span>`;
+        return `<span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">счётчик недоступен</span>` + bal;
     }
-    if (!breakdown) return '<span class="fc-dim">считаю…</span>';
+    if (!breakdown) return '<span class="fc-dim">считаю…</span>' + bal;
 
     const total = SECTIONS.reduce((s, x) => s + (breakdown[x.key] || 0), 0);
     const cell = (label, value, extra) =>
@@ -1189,10 +1448,12 @@ function topbarHtml() {
     const full = '<span class="fc-tb-full">'
         + SECTIONS.map((s) => cell(s.full, fmtInt(breakdown[s.key] || 0))).join('')
         + cell('всего', fmtInt(total), 'fc-tb-total')
+        + balanceCellsHtml(false)
         + '</span>';
     const compact = '<span class="fc-tb-compact">'
         + SECTIONS.map((s) => cell(s.short, fmtShort(breakdown[s.key] || 0))).join('')
         + cell('Σ', fmtShort(total), 'fc-tb-total')
+        + balanceCellsHtml(true)
         + '</span>';
 
     const warn = breakdownErr
@@ -1337,6 +1598,7 @@ function init() {
     });
 
     addSettingsPanel();
+    startNanoPolling();
     setTimeout(renderAllLines, 500);
     setTimeout(() => { renderTopbar(); scheduleBreakdown(); }, 900);
     console.log(`${LOG} загружен. Стриминг обязателен: usage читается из потока ответа.`);
