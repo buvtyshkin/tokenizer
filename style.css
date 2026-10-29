@@ -125,5 +125,6 @@
 .fc-bal-group > b { display: block; margin-bottom: 4px; }
 .fc-num-input { width: 9em !important; }
 .fc-tb-bal .fc-tb-v { font-variant-numeric: tabular-nums; }
-.fc-tb-low .fc-tb-v { color: #ef8b8b; }
+.fc-tb-low .fc-bal-amt { color: #ef8b8b; }
+.fc-bal-sep { opacity: 0.5; margin: 0 3px; font-weight: normal; }
 .fc-tb-stale { opacity: 0.55; }

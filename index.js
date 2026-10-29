@@ -36,6 +36,13 @@ const BALANCE_DEFAULTS = {
 };
 const NANO_BALANCE_URL = '/api/plugins/fisher-tokens/balance/nanogpt';
 const NANO_AFTER_GEN_MS = 20_000;          // после ответа NanoGPT списание доезжает не сразу
+// Источники, у которых ведётся остаток. У остальных в строке над чатом — только расход за сегодня.
+const BALANCE_SOURCES = new Set(['claude', 'nanogpt']);
+const SOURCE_LABELS = {
+    claude: 'Claude', nanogpt: 'NanoGPT', makersuite: 'AI Studio', vertexai: 'Vertex',
+    openrouter: 'OpenRouter', openai: 'OpenAI', custom: 'Custom', deepseek: 'DeepSeek',
+    moonshot: 'Moonshot', zai: 'Z.AI', aimlapi: 'AI/ML API', xai: 'xAI', mistralai: 'Mistral',
+};
 
 let ctx = null;
 let settings = null;
@@ -50,6 +57,7 @@ let lastPromptByChat = {};        // { chatLabel: {model, in, cr, cw} } — ра
 let nanoTimer = null;             // периодический опрос баланса NanoGPT
 let nanoAfterGenTimer = null;     // опрос после ответа через NanoGPT
 let lowWarned = {};               // { claude: true } — о низком остатке уже предупредили
+let midnightTimer = null;         // в полночь «сегодня» обнуляется — перерисовать строку
 
 // ---------- утилиты ----------
 
@@ -636,6 +644,7 @@ function recordLedger(rec, kind, genType) {
     if (!rec.priced) d.unpriced += 1;
 
     trackBalanceSpend(rec);
+    if (settings.showTopbar) renderTopbar();
     pruneLedger();
     settings.__dirty = true;
     ctx.saveSettingsDebounced();
@@ -751,26 +760,82 @@ function startNanoPolling() {
     nanoTimer = setInterval(() => refreshNanoBalance(), Math.max(5, Number(n.every) || 30) * 60_000);
 }
 
-/** Ячейки остатков для строки над чатом. */
+/** Активное подключение Таверны; null — не Chat Completion (текстовые бэкенды мы не учитываем). */
+function activeSource() {
+    const c = SillyTavern.getContext();   // mainApi в контексте — снимок, берём свежий
+    if (c.mainApi !== 'openai') return null;
+    return c.chatCompletionSettings?.chat_completion_source || null;
+}
+
+/**
+ * Источник записи журнала. Метку src записи несут с 29.10.2026; у более ранних
+ * claude-* — это Claude напрямую: NanoGPT тогда не использовался.
+ */
+function entrySource(e) {
+    if (e.src) return e.src;
+    return /^claude-/.test(String(e.model || '')) ? 'claude' : null;
+}
+
+/** Расход за сегодня (с локальной полуночи) через один источник: ответы, служебные, helper, пинги. */
+function spentTodayBySource(src) {
+    const since = startOfToday();
+    let cost = 0;
+    for (const e of settings.raw) {
+        if (e.t >= since && entrySource(e) === src) cost += e.cost || 0;
+    }
+    return cost;
+}
+
+/** Ячейка для строки над чатом: «остаток / сегодня» по активному подключению. */
 function balanceCellsHtml(compact) {
     if (!settings?.showBalances) return '';
+    const src = activeSource();
+    if (!src) return '';
     const b = B();
-    const out = [];
-    const est = claudeEstimate();
-    if (est != null) {
-        const low = b.claude.warnBelow > 0 && est < b.claude.warnBelow ? ' fc-tb-low' : '';
-        const title = `оценка: ${fmtBal(b.claude.amount)} из Console на ${fmtWhen(b.claude.at)} минус ${fmtBal(b.claude.spent)}, насчитанные с тех пор`;
-        out.push(`<span class="fc-tb-cell fc-tb-bal${low}" title="${escapeHtml(title)}"><span class="fc-tb-l">${compact ? 'C' : 'Claude'}</span><span class="fc-tb-v">≈${fmtBal(est)}</span></span>`);
+    const name = SOURCE_LABELS[src] || src;
+    const today = spentTodayBySource(src);
+    const dayPart = `<span class="fc-bal-day">${fmtUsd(today)}</span>`;
+    const titleDay = `потрачено сегодня с 00:00 через ${name}: ${fmtUsd(today)}`;
+
+    let balPart = '';
+    let titleBal = '';
+    let cls = '';
+    if (BALANCE_SOURCES.has(src)) {
+        let amount = null;
+        if (src === 'claude') {
+            const est = claudeEstimate();
+            if (est != null) {
+                amount = '≈' + fmtBal(est);
+                if (b.claude.warnBelow > 0 && est < b.claude.warnBelow) cls += ' fc-tb-low';
+                titleBal = `остаток — оценка: ${fmtBal(b.claude.amount)} из Console на ${fmtWhen(b.claude.at)} минус ${fmtBal(b.claude.spent)}, насчитанные с тех пор`;
+            } else {
+                titleBal = 'остаток не задан — впишите его в настройках Fisher Cost';
+            }
+        } else if (src === 'nanogpt' && b.nanogpt.auto && b.nanogpt.last) {
+            const v = b.nanogpt.last.spendable ?? b.nanogpt.last.usd;
+            amount = fmtBal(v);
+            if (b.nanogpt.warnBelow > 0 && v < b.nanogpt.warnBelow) cls += ' fc-tb-low';
+            if (b.nanogpt.error) cls += ' fc-tb-stale';
+            titleBal = `остаток с сервера NanoGPT, обновлено ${fmtWhen(b.nanogpt.last.at)}`
+                + (b.nanogpt.error ? ` — последняя попытка не удалась: ${b.nanogpt.error}` : '');
+        } else {
+            titleBal = 'остаток NanoGPT ещё не получен';
+        }
+        balPart = `<span class="fc-bal-amt">${amount ?? '—'}</span><span class="fc-bal-sep">/</span>`;
     }
-    const nl = b.nanogpt.last;
-    if (b.nanogpt.auto && nl) {
-        const v = nl.spendable ?? nl.usd;
-        const low = b.nanogpt.warnBelow > 0 && v < b.nanogpt.warnBelow ? ' fc-tb-low' : '';
-        const stale = b.nanogpt.error ? ' fc-tb-stale' : '';
-        const title = `NanoGPT, обновлено ${fmtWhen(nl.at)}${b.nanogpt.error ? ' — последняя попытка не удалась: ' + b.nanogpt.error : ''}`;
-        out.push(`<span class="fc-tb-cell fc-tb-bal${low}${stale}" title="${escapeHtml(title)}"><span class="fc-tb-l">${compact ? 'N' : 'NanoGPT'}</span><span class="fc-tb-v">${fmtBal(v)}</span></span>`);
-    }
-    return out.join('');
+
+    const title = (titleBal ? titleBal + '\n' : '') + titleDay;
+    return `<span class="fc-tb-cell fc-tb-bal${cls}" title="${escapeHtml(title)}">`
+        + `<span class="fc-tb-l">${compact ? name.charAt(0) : name}</span>`
+        + `<span class="fc-tb-v">${balPart}${dayPart}</span></span>`;
+}
+
+/** В полночь «сегодня» начинается заново — перерисовать строку, даже если запросов не было. */
+function scheduleMidnightRender() {
+    clearTimeout(midnightTimer);
+    const next = new Date();
+    next.setHours(24, 0, 5, 0);
+    midnightTimer = setTimeout(() => { renderTopbar(); scheduleMidnightRender(); }, next.getTime() - Date.now());
 }
 
 function claudeStatusHtml() {
@@ -1189,7 +1254,7 @@ function addSettingsPanel() {
                         </label>
                         <div class="fc-dim">Ещё и через 20 секунд после каждого ответа через NanoGPT. Нужен серверный плагин <code>fisher-tokens</code>.</div>
                     </div>
-                    <label class="checkbox_label"><input type="checkbox" id="fc_bal_topbar"> Показывать остатки в строке над чатом</label>
+                    <label class="checkbox_label"><input type="checkbox" id="fc_bal_topbar"> В строке над чатом: остаток / расход за сегодня — по активному подключению</label>
                 </details>
                 <div id="fc_inline_report"></div>
             </div>
@@ -1599,6 +1664,13 @@ function init() {
 
     addSettingsPanel();
     startNanoPolling();
+    scheduleMidnightRender();
+    // Строка показывает активное подключение — следим за его сменой.
+    for (const ev of [et.CHATCOMPLETION_SOURCE_CHANGED || 'chatcompletion_source_changed',
+        et.MAIN_API_CHANGED || 'main_api_changed',
+        et.CONNECTION_PROFILE_LOADED || 'connection_profile_loaded']) {
+        es.on(ev, () => setTimeout(renderTopbar, 50));
+    }
     setTimeout(renderAllLines, 500);
     setTimeout(() => { renderTopbar(); scheduleBreakdown(); }, 900);
     console.log(`${LOG} загружен. Стриминг обязателен: usage читается из потока ответа.`);
