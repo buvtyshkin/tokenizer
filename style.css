@@ -128,3 +128,10 @@
 .fc-tb-low .fc-bal-amt { color: #ef8b8b; }
 .fc-bal-sep { opacity: 0.5; margin: 0 3px; font-weight: normal; }
 .fc-tb-stale { opacity: 0.55; }
+
+/* Узкий экран: строка над чатом строго в одну линию — итог и расходы, без переносов */
+.fc-topbar .fc-tb-compact {
+    flex-wrap: nowrap;
+    white-space: nowrap;
+    overflow: hidden;
+}

@@ -826,7 +826,7 @@ function balanceCellsHtml(compact) {
 
     const title = (titleBal ? titleBal + '\n' : '') + titleDay;
     return `<span class="fc-tb-cell fc-tb-bal${cls}" title="${escapeHtml(title)}">`
-        + `<span class="fc-tb-l">${compact ? name.charAt(0) : name}</span>`
+        + `<span class="fc-tb-l">${name}</span>`
         + `<span class="fc-tb-v">${balPart}${dayPart}</span></span>`;
 }
 
@@ -1497,34 +1497,29 @@ async function refreshBreakdown() {
 }
 
 function topbarHtml() {
-    // Остатки показываются, даже пока счётчик токенов думает или недоступен.
-    const bal = '<span class="fc-tb-full">' + balanceCellsHtml(false) + '</span>'
-        + '<span class="fc-tb-compact">' + balanceCellsHtml(true) + '</span>';
-    if (!breakdown && breakdownErr) {
-        return `<span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">счётчик недоступен</span>` + bal;
-    }
-    if (!breakdown) return '<span class="fc-dim">считаю…</span>' + bal;
-
-    const total = SECTIONS.reduce((s, x) => s + (breakdown[x.key] || 0), 0);
-    const cell = (label, value, extra) =>
-        `<span class="fc-tb-cell${extra ? ' ' + extra : ''}">`
+    const cell = (label, value, extra, title) =>
+        `<span class="fc-tb-cell${extra ? ' ' + extra : ''}"${title ? ` title="${escapeHtml(title)}"` : ''}>`
         + `<span class="fc-tb-l">${label}</span><span class="fc-tb-v">${value}</span></span>`;
-
-    const full = '<span class="fc-tb-full">'
-        + SECTIONS.map((s) => cell(s.full, fmtInt(breakdown[s.key] || 0))).join('')
-        + cell('всего', fmtInt(total), 'fc-tb-total')
-        + balanceCellsHtml(false)
-        + '</span>';
-    const compact = '<span class="fc-tb-compact">'
-        + SECTIONS.map((s) => cell(s.short, fmtShort(breakdown[s.key] || 0))).join('')
-        + cell('Σ', fmtShort(total), 'fc-tb-total')
-        + balanceCellsHtml(true)
-        + '</span>';
-
-    const warn = breakdownErr
-        ? ` <span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">!</span>`
+    const err = breakdownErr
+        ? `<span class="fc-tb-err" title="${escapeHtml(breakdownErr)}">${breakdown ? '!' : 'счётчик недоступен'}</span>`
         : '';
-    return full + compact + warn;
+
+    let fullCells = '';
+    let compactCells = '';
+    if (breakdown) {
+        const total = SECTIONS.reduce((s, x) => s + (breakdown[x.key] || 0), 0);
+        const detail = SECTIONS.map((s) => `${s.full} ${fmtInt(breakdown[s.key] || 0)}`).join(', ');
+        fullCells = SECTIONS.map((s) => cell(s.full, fmtInt(breakdown[s.key] || 0))).join('')
+            + cell('всего', fmtInt(total), 'fc-tb-total');
+        // На узком экране — одна строка: итог и расходы. Разбивка по секциям — в подсказке.
+        compactCells = cell('всего', fmtShort(total), 'fc-tb-total', detail);
+    } else if (!breakdownErr) {
+        fullCells = compactCells = '<span class="fc-dim">считаю…</span>';
+    }
+
+    // Обе версии целиком, одной строкой каждая; какую показать, решает CSS.
+    return `<span class="fc-tb-full">${fullCells}${balanceCellsHtml(false)}${err}</span>`
+        + `<span class="fc-tb-compact">${compactCells}${balanceCellsHtml(true)}${err}</span>`;
 }
 
 function renderTopbar() {
