@@ -268,6 +268,17 @@ function notifyRefusal(r, model, unbilled) {
 function applyUsage(u, obj) {
     if (!obj || typeof obj !== 'object') return;
     detectRefusal(u, obj);
+    // NanoGPT: сколько на самом деле списано — в последнем чанке стрима или на верхнем
+    // уровне non-stream ответа. Приходит и без include_usage, в отличие от токенов.
+    const np = obj.x_nanogpt_pricing;
+    if (np) {
+        const v = Number(np.cost ?? np.amount);
+        if (Number.isFinite(v) && (np.currency || 'USD') === 'USD') {
+            u.billed = v;
+            u.seen = true;
+            if (obj.model) u.model = obj.model;
+        }
+    }
     // Anthropic
     if (obj.type === 'message_start' && obj.message) {
         const mu = obj.message.usage || {};
@@ -309,7 +320,8 @@ function applyUsage(u, obj) {
     }
 
     // Anthropic без стриминга: usage лежит целиком в теле ответа, а не в дельтах.
-    if (obj.usage && (obj.usage.input_tokens != null || obj.usage.output_tokens != null)) {
+    // NanoGPT кладёт input_tokens рядом с prompt_tokens — такой usage разбирается ниже, как OpenAI.
+    if (obj.usage && obj.usage.prompt_tokens == null && (obj.usage.input_tokens != null || obj.usage.output_tokens != null)) {
         const mu = obj.usage;
         if (obj.model) u.model = obj.model;
         u.in = mu.input_tokens ?? u.in;
@@ -327,10 +339,17 @@ function applyUsage(u, obj) {
     const mu = obj.usage || obj.choices?.[0]?.usage;
     if (mu && (mu.prompt_tokens != null || mu.completion_tokens != null)) {
         // OpenAI: prompt_tokens_details.cached_tokens; Moonshot: cached_tokens; DeepSeek: prompt_cache_hit_tokens
-        const cached = mu.prompt_tokens_details?.cached_tokens ?? mu.cached_tokens ?? mu.prompt_cache_hit_tokens ?? 0;
-        u.in = (mu.prompt_tokens || 0) - cached;
+        const cached = mu.prompt_tokens_details?.cached_tokens ?? mu.cached_tokens ?? mu.prompt_cache_hit_tokens ?? mu.cache_read_input_tokens ?? 0;
+        // NanoGPT (Claude): запись в кэш — cache_creation_input_tokens, и она тоже входит в prompt_tokens
+        const written = mu.cache_creation_input_tokens ?? mu.prompt_tokens_details?.cache_write_tokens ?? 0;
+        u.in = Math.max(0, (mu.prompt_tokens || 0) - cached - written);
         u.cr = cached;
-        u.cw = mu.prompt_tokens_details?.cache_write_tokens ?? u.cw;
+        u.cw = written;
+        const ttl = obj.x_nanogpt_cache?.ttl;
+        if (written && (ttl === '5m' || ttl === '1h')) {
+            u.cw5 = ttl === '5m' ? written : 0;
+            u.cw1 = ttl === '1h' ? written : 0;
+        }
         u.out = mu.completion_tokens || 0;
         const think = mu.completion_tokens_details?.reasoning_tokens;
         if (think) u.think = think;   // уже входит в completion_tokens
@@ -461,7 +480,8 @@ function estimateRefresh(meta) {
 }
 
 function recordRefresh(u, meta, estimated) {
-    const { cost, priced } = u.seen ? computeCost(u) : { cost: null, priced: false };
+    const { cost, priced } = u.billed != null ? { cost: u.billed, priced: true }
+        : u.seen ? computeCost(u) : { cost: null, priced: false };
     const rec = { t: Date.now(), model: u.model || meta.model || '?', in: u.in || 0, out: u.out || 0, cr: u.cr || 0, cw: u.cw || 0, cost, priced, est: !!estimated, src: meta.source || null };
     recordLedger(rec, 'refresh', 'refresh');
     console.log(`${LOG} пинг кэш-рефрешера${estimated ? ' (оценка)' : ''}`, rec);
@@ -504,13 +524,15 @@ function onSettingsReady(generate_data) {
 // ---------- привязка usage к сообщению / журналу ----------
 
 function onUsage(u, meta) {
-    const computed = computeCost(u);
+    // NanoGPT сам сообщил списанное — это точнее таблицы цен, да и его цены свои.
+    const billed = u.billed != null;
+    const computed = billed ? { cost: u.billed, priced: true, long: false, offpeak: false } : computeCost(u);
     const { priced, long, offpeak } = computed;
     // Anthropic не тарифицирует отказ, случившийся до начала вывода, — ни вход,
     // ни выход, хотя usage вход сообщает. Отказ посреди ответа оплачивается как
     // обычно, по уже выданному тексту.
     const unbilledRefusal = !!(u.refusal && u.refusal.provider === 'anthropic' && !u.out);
-    const cost = unbilledRefusal ? 0 : computed.cost;
+    const cost = unbilledRefusal && !billed ? 0 : computed.cost;
     const rec = {
         t: Date.now(),
         model: u.model || meta.model || '?',
@@ -526,6 +548,7 @@ function onUsage(u, meta) {
         cost,
         priced,
         src: meta.source || null,   // источник Таверны: claude, nanogpt… — по нему ведутся остатки
+        ...(billed ? { billed: true } : {}),
         ...(u.refusal ? { refusal: { ...u.refusal, unbilled: unbilledRefusal } } : {}),
     };
 
@@ -913,6 +936,8 @@ function messageLineHtml(u, tok) {
         u.think ? `из них рассуждение ${fmtInt(u.think)}` : '',
         u.long ? 'тариф длинного контекста' : '',
         u.offpeak ? 'непиковый тариф' : '',
+        u.billed ? 'стоимость — списание NanoGPT' : '',
+        u.billed && !u.in && !u.out && !u.cr && !u.cw ? 'токены NanoGPT не прислал — нет патча сервера, см. README' : '',
     ].filter(Boolean).map((x) => '\n' + x).join('');
     const title = `${u.model}\nвход ${fmtInt(u.in)}\nвыход ${fmtInt(u.out)}\nкэш-чтение ${fmtInt(u.cr)}\nкэш-запись ${fmtInt(u.cw)}${ttl ? ' (' + ttl + ')' : ''}\nкэш-хит ${hit}%${extra}`;
 
